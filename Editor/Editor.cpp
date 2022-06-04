@@ -30,6 +30,7 @@ void Editor::Initialize()
 	//infoDisplay.logical_size = true;
 	infoDisplay.colorspace = true;
 	infoDisplay.heap_allocation_counter = true;
+	infoDisplay.vram_usage = true;
 
 	wi::renderer::SetOcclusionCullingEnabled(true);
 
@@ -948,7 +949,7 @@ void EditorComponent::Load()
 		helpLabel.Create("HelpLabel");
 		helpLabel.SetText(ss);
 		helpLabel.SetVisible(false);
-		helpLabel.SetColor(wi::Color(113, 183, 214, 100), wi::gui::WIDGETSTATE::IDLE);
+		helpLabel.SetColor(wi::Color(113, 183, 214, 100));
 		GetGUI().AddWidget(&helpLabel);
 	}
 
@@ -1021,7 +1022,6 @@ void EditorComponent::Load()
 		RecordSelection(archive);
 
 		});
-	sceneGraphView.SetColor(wi::Color(100, 100, 100, 100), wi::gui::IDLE);
 	GetGUI().AddWidget(&sceneGraphView);
 
 
