@@ -9,12 +9,12 @@ using namespace wi::ecs;
 using namespace wi::scene;
 using namespace wi::graphics;
 
-void PaintToolWindow::Create(EditorComponent* editor)
+void PaintToolWindow::Create(EditorComponent* _editor)
 {
-	this->editor = editor;
+	editor = _editor;
 
 	wi::gui::Window::Create("Paint Tool Window");
-	SetSize(XMFLOAT2(410, 610));
+	SetSize(XMFLOAT2(360, 540));
 
 	float x = 105;
 	float y = 0;
@@ -80,7 +80,7 @@ void PaintToolWindow::Create(EditorComponent* editor)
 	y += step + 5;
 
 	infoLabel.Create("Paint Tool is disabled.");
-	infoLabel.SetSize(XMFLOAT2(400 - 20, 100));
+	infoLabel.SetSize(XMFLOAT2(GetScale().x - 20, 100));
 	infoLabel.SetPos(XMFLOAT2(10, y));
 	infoLabel.SetColor(wi::Color::Transparent());
 	AddWidget(&infoLabel);
@@ -162,7 +162,7 @@ void PaintToolWindow::Create(EditorComponent* editor)
 	saveTextureButton.SetPos(XMFLOAT2(x, y += step));
 	saveTextureButton.OnClick([this] (wi::gui::EventArgs args) {
 
-		Scene& scene = wi::scene::GetScene();
+		Scene& scene = editor->GetCurrentScene();
 		ObjectComponent* object = scene.objects.GetComponent(entity);
 		if (object == nullptr || object->meshID == INVALID_ENTITY)
 			return;
@@ -321,8 +321,8 @@ void PaintToolWindow::Update(float dt)
 	const bool backfaces = backfaceCheckBox.GetCheck();
 	const bool wireframe = wireCheckBox.GetCheck();
 
-	Scene& scene = wi::scene::GetScene();
-	const CameraComponent& camera = wi::scene::GetCamera();
+	Scene& scene = editor->GetCurrentScene();
+	const CameraComponent& camera = editor->GetCurrentEditorScene().camera;
 	const XMVECTOR C = XMLoadFloat2(&pos);
 	const XMMATRIX VP = camera.GetViewProjection();
 	const XMVECTOR MUL = XMVectorSet(0.5f, -0.5f, 1, 1);
@@ -1044,7 +1044,7 @@ void PaintToolWindow::RecordHistory(bool start, CommandList cmd)
 	}
 
 	wi::Archive& archive = *currentHistory;
-	Scene& scene = wi::scene::GetScene();
+	Scene& scene = editor->GetCurrentScene();
 
 	switch (GetMode())
 	{
@@ -1177,7 +1177,7 @@ void PaintToolWindow::ConsumeHistoryOperation(wi::Archive& archive, bool undo)
 
 	modeComboBox.SetSelected(historymode);
 
-	Scene& scene = wi::scene::GetScene();
+	Scene& scene = editor->GetCurrentScene();
 
 	switch (historymode)
 	{

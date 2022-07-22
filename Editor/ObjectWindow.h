@@ -8,7 +8,7 @@ class ObjectWindow : public wi::gui::Window
 public:
 	void Create(EditorComponent* editor);
 
-	EditorComponent* editor;
+	EditorComponent* editor = nullptr;
 	wi::ecs::Entity entity;
 	void SetEntity(wi::ecs::Entity entity);
 
@@ -32,6 +32,7 @@ public:
 	wi::gui::Slider restitutionSlider;
 	wi::gui::Slider lineardampingSlider;
 	wi::gui::Slider angulardampingSlider;
+	wi::gui::Slider physicsMeshLODSlider;
 	wi::gui::CheckBox disabledeactivationCheckBox;
 	wi::gui::CheckBox kinematicCheckBox;
 

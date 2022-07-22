@@ -20,6 +20,7 @@
 #include "wiShaderCompiler.h"
 #include "wiTimer.h"
 #include "wiUnorderedMap.h" // leave it here for shader dump!
+#include "wiFont.h"
 
 #include "shaders/ShaderInterop_Postprocess.h"
 #include "shaders/ShaderInterop_Raytracing.h"
@@ -27,7 +28,6 @@
 #include "shaders/ShaderInterop_DDGI.h"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 
 using namespace wi::primitive;
@@ -67,10 +67,6 @@ void barrier_stack_flush(CommandList cmd)
 	barrier_stack.clear();
 }
 
-uint32_t SHADOWRES_2D = 1024;
-uint32_t SHADOWRES_CUBE = 256;
-uint32_t SHADOWCOUNT_2D = 5 + 3 + 3;
-uint32_t SHADOWCOUNT_CUBE = 5;
 bool TRANSPARENTSHADOWSENABLED = true;
 bool wireRender = false;
 bool debugBoneLines = false;
@@ -123,12 +119,11 @@ struct VoxelizedSceneData
 	uint32_t mips = 7;
 } voxelSceneData;
 
-Texture shadowMapArray_2D;
-Texture shadowMapArray_Cube;
-Texture shadowMapArray_Transparent_2D;
-Texture shadowMapArray_Transparent_Cube;
-wi::vector<RenderPass> renderpasses_shadow2D;
-wi::vector<RenderPass> renderpasses_shadowCube;
+Texture shadowMapAtlas;
+Texture shadowMapAtlas_Transparent;
+RenderPass renderpass_shadowMapAtlas;
+int max_shadow_resolution_2D = 1024;
+int max_shadow_resolution_cube = 256;
 
 wi::vector<std::pair<XMFLOAT4X4, XMFLOAT4>> renderableBoxes;
 wi::vector<std::pair<Sphere, XMFLOAT4>> renderableSpheres;
@@ -138,6 +133,7 @@ wi::vector<RenderableLine2D> renderableLines2D;
 wi::vector<RenderablePoint> renderablePoints;
 wi::vector<RenderableTriangle> renderableTriangles_solid;
 wi::vector<RenderableTriangle> renderableTriangles_wireframe;
+wi::vector<uint8_t> debugTextStorage; // A stream of DebugText struct + text characters
 wi::vector<PaintRadius> paintrads;
 
 wi::SpinLock deferredMIPGenLock;
@@ -150,34 +146,66 @@ Texture texture_detailNoise;
 Texture texture_curlNoise;
 Texture texture_weatherMap;
 
+// A dummy luminance buffer with exposure set to 1.
+// This avoids having to branch in shaders that consume the exposure value
+// when eye adaption is disabled.
+// It also works around an apparent bug in the drivers for certain GTX 10xx cards
+// where just testing if a bindless buffer descriptor is valid requires that it is valid.
+// See: https://github.com/turanszkij/WickedEngine/issues/450
+GPUBuffer luminance_dummy;
+
 // Direct reference to a renderable instance:
 struct RenderBatch
 {
 	uint64_t data;
-	constexpr operator uint64_t() const { return data; }
 
-	inline void Create(size_t meshIndex, size_t instanceIndex, float distance)
+	inline void Create(uint32_t meshIndex, uint32_t instanceIndex, float distance)
 	{
+		// These asserts are a indicating if render queue limits are reached:
 		assert(meshIndex < 0x00FFFFFF);
 		assert(instanceIndex < 0x00FFFFFF);
 
 		data = 0;
-		data |= uint64_t(XMConvertFloatToHalf(distance) & 0xFFFF) << 48ull;
-		data |= uint64_t(meshIndex & 0x00FFFFFF) << 24ull;
+		data |= uint64_t(meshIndex & 0x00FFFFFF) << 40ull;
+		data |= uint64_t(XMConvertFloatToHalf(distance) & 0xFFFF) << 24ull;
 		data |= uint64_t(instanceIndex & 0x00FFFFFF) << 0ull;
 	}
 
 	inline float GetDistance() const
 	{
-		return XMConvertHalfToFloat(HALF(data >> 48ull));
+		return XMConvertHalfToFloat(HALF((data >> 24ull) & 0xFFFF));
 	}
 	inline uint32_t GetMeshIndex() const
 	{
-		return (data >> 24ull) & 0x00FFFFFF;
+		return (data >> 40ull) & 0x00FFFFFF;
 	}
 	inline uint32_t GetInstanceIndex() const
 	{
 		return (data >> 0ull) & 0x00FFFFFF;
+	}
+
+	// opaque sorting
+	//	Priority is set to mesh index to have more instancing
+	//	distance is second priority (front to back Z-buffering)
+	bool operator<(const RenderBatch& other) const
+	{
+		return data < other.data;
+	}
+	// transparent sorting
+	//	Priority is distance for correct alpha blending (back to front rendering)
+	//	mesh index is second priority for instancing
+	bool operator>(const RenderBatch& other) const
+	{
+		// Swap bits of meshIndex and distance to prioritize distance more
+		uint64_t a_data = 0ull;
+		a_data |= ((data >> 24ull) & 0xFFFF) << 48ull; // distance repack
+		a_data |= ((data >> 40ull) & 0x00FFFFFF) << 24ull; // meshIndex repack
+		a_data |= data & 0x00FFFFFF; // instanceIndex repack
+		uint64_t b_data = 0ull;
+		b_data |= ((other.data >> 24ull) & 0xFFFF) << 48ull; // distance repack
+		b_data |= ((other.data >> 40ull) & 0x00FFFFFF) << 24ull; // meshIndex repack
+		b_data |= other.data & 0x00FFFFFF; // instanceIndex repack
+		return a_data > b_data;
 	}
 };
 
@@ -186,36 +214,21 @@ struct RenderQueue
 {
 	wi::vector<RenderBatch> batches;
 
-	enum RenderQueueSortType
-	{
-		SORT_FRONT_TO_BACK,
-		SORT_BACK_TO_FRONT,
-	};
-
 	inline void init()
 	{
 		batches.clear();
 	}
-	inline void add(size_t meshIndex, size_t instanceIndex, float distance)
+	inline void add(uint32_t meshIndex, uint32_t instanceIndex, float distance)
 	{
 		batches.emplace_back().Create(meshIndex, instanceIndex, distance);
 	}
-	inline void sort(RenderQueueSortType sortType = SORT_FRONT_TO_BACK)
+	inline void sort_transparent()
 	{
-		if (!batches.empty())
-		{
-			switch (sortType)
-			{
-			case wi::renderer::RenderQueue::SORT_FRONT_TO_BACK:
-				std::sort(batches.begin(), batches.end(), std::less<uint64_t>());
-				break;
-			case wi::renderer::RenderQueue::SORT_BACK_TO_FRONT:
-				std::sort(batches.begin(), batches.end(), std::greater<uint64_t>());
-				break;
-			default:
-				break;
-			}
-		}
+		std::sort(batches.begin(), batches.end(), std::greater<RenderBatch>());
+	}
+	inline void sort_opaque()
+	{
+		std::sort(batches.begin(), batches.end(), std::less<RenderBatch>());
 	}
 	inline bool empty() const
 	{
@@ -559,9 +572,7 @@ PipelineState PSO_decal;
 PipelineState PSO_occlusionquery;
 PipelineState PSO_impostor[RENDERPASS_COUNT];
 PipelineState PSO_impostor_wire;
-PipelineState PSO_captureimpostor_albedo;
-PipelineState PSO_captureimpostor_normal;
-PipelineState PSO_captureimpostor_surface;
+PipelineState PSO_captureimpostor;
 
 PipelineState PSO_lightvisualizer[LightComponent::LIGHTTYPE_COUNT];
 PipelineState PSO_volumetriclight[LightComponent::LIGHTTYPE_COUNT];
@@ -855,7 +866,6 @@ void LoadShaders()
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_OBJECT_PREPASS_ALPHATEST], "objectPS_prepass_alphatest.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_IMPOSTOR_PREPASS], "impostorPS_prepass.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_IMPOSTOR_SIMPLE], "impostorPS_simple.cso"); });
-	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_IMPOSTOR_WIRE], "impostorPS_wire.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_LIGHTVISUALIZER], "lightVisualizerPS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_VOLUMETRICLIGHT_DIRECTIONAL], "volumetricLight_DirectionalPS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_VOLUMETRICLIGHT_POINT], "volumetricLight_PointPS.cso"); });
@@ -863,9 +873,7 @@ void LoadShaders()
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_ENVMAP], "envMapPS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_ENVMAP_SKY_STATIC], "envMap_skyPS_static.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_ENVMAP_SKY_DYNAMIC], "envMap_skyPS_dynamic.cso"); });
-	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_CAPTUREIMPOSTOR_ALBEDO], "captureImpostorPS_albedo.cso"); });
-	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_CAPTUREIMPOSTOR_NORMAL], "captureImpostorPS_normal.cso"); });
-	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_CAPTUREIMPOSTOR_SURFACE], "captureImpostorPS_surface.cso"); });
+	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_CAPTUREIMPOSTOR], "captureImpostorPS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_CUBEMAP], "cubeMapPS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_VERTEXCOLOR], "vertexcolorPS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::PS, shaders[PSTYPE_SKY_STATIC], "skyPS_static.cso"); });
@@ -1072,6 +1080,7 @@ void LoadShaders()
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_DDGI_UPDATE_DEPTH], "ddgi_updateCS_depth.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_TERRAIN_VIRTUALTEXTURE_UPDATE], "terrainVirtualTextureUpdateCS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_MESHLET_PREPARE], "meshlet_prepareCS.cso"); });
+	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_IMPOSTOR_PREPARE], "impostor_prepareCS.cso"); });
 
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::HS, shaders[HSTYPE_OBJECT], "objectHS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::HS, shaders[HSTYPE_OBJECT_PREPASS], "objectHS_prepass.cso"); });
@@ -1348,7 +1357,7 @@ void LoadShaders()
 			break;
 		default:
 			desc.vs = &shaders[VSTYPE_IMPOSTOR];
-			desc.ps = &shaders[PSTYPE_IMPOSTOR_SIMPLE];
+			desc.ps = &shaders[PSTYPE_IMPOSTOR_PREPASS];
 			break;
 		}
 
@@ -1357,7 +1366,7 @@ void LoadShaders()
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) {
 		PipelineStateDesc desc;
 		desc.vs = &shaders[VSTYPE_IMPOSTOR];
-		desc.ps = &shaders[PSTYPE_IMPOSTOR_WIRE];
+		desc.ps = &shaders[PSTYPE_IMPOSTOR_SIMPLE];
 		desc.rs = &rasterizers[RSTYPE_WIRE_DOUBLESIDED];
 		desc.bs = &blendStates[BSTYPE_OPAQUE];
 		desc.dss = &depthStencils[DSSTYPE_DEFAULT];
@@ -1372,14 +1381,8 @@ void LoadShaders()
 		desc.bs = &blendStates[BSTYPE_OPAQUE];
 		desc.dss = &depthStencils[DSSTYPE_CAPTUREIMPOSTOR];
 
-		desc.ps = &shaders[PSTYPE_CAPTUREIMPOSTOR_ALBEDO];
-		device->CreatePipelineState(&desc, &PSO_captureimpostor_albedo);
-
-		desc.ps = &shaders[PSTYPE_CAPTUREIMPOSTOR_NORMAL];
-		device->CreatePipelineState(&desc, &PSO_captureimpostor_normal);
-
-		desc.ps = &shaders[PSTYPE_CAPTUREIMPOSTOR_SURFACE];
-		device->CreatePipelineState(&desc, &PSO_captureimpostor_surface);
+		desc.ps = &shaders[PSTYPE_CAPTUREIMPOSTOR];
+		device->CreatePipelineState(&desc, &PSO_captureimpostor);
 		});
 
 	wi::jobsystem::Dispatch(ctx, LightComponent::LIGHTTYPE_COUNT, 1, [](wi::jobsystem::JobArgs args) {
@@ -1802,6 +1805,21 @@ void LoadBuffers()
 		device->CreateTexture(&desc, nullptr, &textures[TEXTYPE_2D_SKYATMOSPHERE_SKYLUMINANCELUT]);
 		device->SetName(&textures[TEXTYPE_2D_SKYATMOSPHERE_SKYLUMINANCELUT], "textures[TEXTYPE_2D_SKYATMOSPHERE_SKYLUMINANCELUT]");
 	}
+	{
+		// the dummy buffer is read-only so only the first 'exposure' value is needed,
+		// not the luminance or histogram values in the full version of the buffer used
+        // when eye adaption is enabled.
+		float values[1] = { 1 };
+
+		GPUBufferDesc desc;
+		desc.size = sizeof(values);
+		desc.bind_flags = BindFlag::SHADER_RESOURCE;
+		desc.misc_flags = ResourceMiscFlag::BUFFER_RAW;
+		device->CreateBuffer(&desc, values, &luminance_dummy);
+		device->SetName(&luminance_dummy, "luminance_dummy");
+
+		static_assert(LUMINANCE_BUFFER_OFFSET_EXPOSURE == 0);
+	}
 }
 void SetUpStates()
 {
@@ -1990,12 +2008,6 @@ void SetUpStates()
 
 	BlendState bd;
 	bd.render_target[0].blend_enable = false;
-	bd.render_target[0].src_blend = Blend::SRC_ALPHA;
-	bd.render_target[0].dest_blend = Blend::INV_SRC_ALPHA;
-	bd.render_target[0].blend_op = BlendOp::MAX;
-	bd.render_target[0].src_blend_alpha = Blend::ONE;
-	bd.render_target[0].dest_blend_alpha = Blend::ZERO;
-	bd.render_target[0].blend_op_alpha = BlendOp::ADD;
 	bd.render_target[0].render_target_write_mask = ColorWrite::ENABLE_ALL;
 	bd.alpha_to_coverage_enable = false;
 	bd.independent_blend_enable = false;
@@ -2195,9 +2207,6 @@ void Initialize()
 	static wi::eventhandler::Handle handle2 = wi::eventhandler::Subscribe(wi::eventhandler::EVENT_RELOAD_SHADERS, [](uint64_t userdata) { LoadShaders(); });
 	LoadShaders();
 
-	SetShadowProps2D(SHADOWRES_2D, SHADOWCOUNT_2D);
-	SetShadowPropsCube(SHADOWRES_CUBE, SHADOWCOUNT_CUBE);
-
 	wi::backlog::post("wi::renderer Initialized (" + std::to_string((int)std::round(timer.elapsed())) + " ms)");
 }
 void ClearWorld(Scene& scene)
@@ -2239,9 +2248,9 @@ struct SHCAM
 };
 inline void CreateSpotLightShadowCam(const LightComponent& light, SHCAM& shcam)
 {
-	shcam = SHCAM(light.position, light.rotation, 0.1f, light.GetRange(), light.fov);
+	shcam = SHCAM(light.position, light.rotation, 0.1f, light.GetRange(), light.outerConeAngle * 2);
 }
-inline void CreateDirLightShadowCams(const LightComponent& light, CameraComponent camera, std::array<SHCAM, CASCADE_COUNT>& shcams)
+inline void CreateDirLightShadowCams(const LightComponent& light, CameraComponent camera, SHCAM* shcams, size_t shcam_count)
 {
 	if (GetTemporalAAEnabled())
 	{
@@ -2264,6 +2273,7 @@ inline void CreateDirLightShadowCams(const LightComponent& light, CameraComponen
 		referenceSplitClamp * 0.1f,		// mid-far split
 		referenceSplitClamp * 1.0f,		// far plane
 	};
+	assert(shcam_count <= CASCADE_COUNT);
 
 	// Unproject main frustum corners into world space (notice the reversed Z projection!):
 	const XMMATRIX unproj = camera.GetInvViewProjection();
@@ -2280,7 +2290,7 @@ inline void CreateDirLightShadowCams(const LightComponent& light, CameraComponen
 	};
 
 	// Compute shadow cameras:
-	for (int cascade = 0; cascade < CASCADE_COUNT; ++cascade)
+	for (int cascade = 0; cascade < shcam_count; ++cascade)
 	{
 		// Compute cascade sub-frustum in light-view-space from the main frustum corners:
 		const float split_near = splits[cascade];
@@ -2319,7 +2329,7 @@ inline void CreateDirLightShadowCams(const LightComponent& light, CameraComponen
 
 		// Snap cascade to texel grid:
 		const XMVECTOR extent = XMVectorSubtract(vMax, vMin);
-		const XMVECTOR texelSize = extent / float(GetShadowRes2D());
+		const XMVECTOR texelSize = extent / float(light.shadow_rect.w);
 		vMin = XMVectorFloor(vMin / texelSize) * texelSize;
 		vMax = XMVectorFloor(vMax / texelSize) * texelSize;
 		center = (vMin + vMax) * 0.5f;
@@ -2344,7 +2354,16 @@ inline void CreateDirLightShadowCams(const LightComponent& light, CameraComponen
 	}
 
 }
-
+inline void CreateCubemapCameras(const XMFLOAT3& position, float zNearP, float zFarP, SHCAM* shcams, size_t shcam_count)
+{
+	assert(shcam_count == 6);
+	shcams[0] = SHCAM(position, XMFLOAT4(0.5f, -0.5f, -0.5f, -0.5f), zNearP, zFarP, XM_PIDIV2); //+x
+	shcams[1] = SHCAM(position, XMFLOAT4(0.5f, 0.5f, 0.5f, -0.5f), zNearP, zFarP, XM_PIDIV2); //-x
+	shcams[2] = SHCAM(position, XMFLOAT4(1, 0, 0, -0), zNearP, zFarP, XM_PIDIV2); //+y
+	shcams[3] = SHCAM(position, XMFLOAT4(0, 0, 0, -1), zNearP, zFarP, XM_PIDIV2); //-y
+	shcams[4] = SHCAM(position, XMFLOAT4(0.707f, 0, 0, -0.707f), zNearP, zFarP, XM_PIDIV2); //+z
+	shcams[5] = SHCAM(position, XMFLOAT4(0, 0.707f, 0.707f, 0), zNearP, zFarP, XM_PIDIV2); //-z
+}
 
 ForwardEntityMaskCB ForwardEntityCullingCPU(const Visibility& vis, const AABB& batch_aabb, RENDERPASS renderPass)
 {
@@ -2360,7 +2379,7 @@ ForwardEntityMaskCB ForwardEntityCullingCPU(const Visibility& vis, const AABB& b
 	uint32_t buckets[2] = { 0,0 };
 	for (size_t i = 0; i < std::min(size_t(64), vis.visibleLights.size()); ++i) // only support indexing 64 lights at max for now
 	{
-		const uint16_t lightIndex = vis.visibleLights[i].index;
+		const uint32_t lightIndex = vis.visibleLights[i];
 		const AABB& light_aabb = vis.scene->aabb_lights[lightIndex];
 		if (light_aabb.intersects(batch_aabb))
 		{
@@ -2398,6 +2417,35 @@ ForwardEntityMaskCB ForwardEntityCullingCPU(const Visibility& vis, const AABB& b
 	}
 
 	return cb;
+}
+
+void Workaround(const int bug , CommandList cmd)
+{
+	if (bug == 1)
+	{
+		//PE: Strange DX12 bug, we must change the pso/pipeline state, just one time.
+		//PE: After this there will be no "black dots" or culling/depth errors.
+		//PE: This bug only happen on some nvidia cards ?
+		//PE: https://github.com/turanszkij/WickedEngine/issues/450#issuecomment-1143647323
+
+		//PE: We MUST use RENDERPASS_VOXELIZE (DSSTYPE_DEPTHDISABLED) or it will not work ?
+		const PipelineState* pso = &PSO_object[0][RENDERPASS_VOXELIZE][BLENDMODE_OPAQUE][0][0][0];
+
+		device->EventBegin("Workaround 1", cmd);
+		static RenderPass renderpass_clear;
+		if (!renderpass_clear.IsValid())
+		{
+			RenderPassDesc renderpassdesc;
+			renderpassdesc.flags = RenderPassDesc::Flags::EMPTY;
+			device->CreateRenderPass(&renderpassdesc, &renderpass_clear);
+		}
+		device->RenderPassBegin(&renderpass_clear, cmd);
+		device->BindPipelineState(pso, cmd);
+		device->DrawIndexedInstanced(0, 0, 0, 0, 0, cmd); //PE: Just need predraw(cmd);
+		device->RenderPassEnd(cmd);
+		device->EventEnd(cmd);
+	}
+	return;
 }
 
 void RenderMeshes(
@@ -2588,16 +2636,7 @@ void RenderMeshes(
 			instancedBatch.lod = instance.lod;
 		}
 
-		float dither = instance.GetTransparency();
-
-		if (instance.IsImpostorPlacement())
-		{
-			float distance = batch.GetDistance();
-			float swapDistance = instance.impostorSwapDistance;
-			float fadeThreshold = instance.impostorFadeThresholdRadius;
-			dither = std::max(0.0f, distance - swapDistance) / fadeThreshold;
-		}
-
+		const float dither = std::max(instance.GetTransparency(), std::max(0.0f, batch.GetDistance() - instance.fadeDistance) / instance.radius);
 		if (dither > 0)
 		{
 			instancedBatch.forceAlphatestForDithering = 1;
@@ -2642,82 +2681,34 @@ void RenderImpostors(
 	const PipelineState* pso = &PSO_impostor[renderPass];
 	if (IsWireRender())
 	{
-		switch (renderPass)
+		if (renderPass != RENDERPASS_PREPASS)
 		{
-		case RENDERPASS_MAIN:
 			pso = &PSO_impostor_wire;
 		}
-		return;
-	}
-
-	if (vis.scene->impostors.GetCount() > 0 && pso != nullptr)
-	{
-		uint32_t instanceCount = 0;
-		for (size_t impostorID = 0; impostorID < vis.scene->impostors.GetCount(); ++impostorID)
-		{
-			const ImpostorComponent& impostor = vis.scene->impostors[impostorID];
-			if (vis.camera->frustum.CheckBoxFast(impostor.aabb))
-			{
-				instanceCount += (uint32_t)impostor.instances.size();
-			}
-		}
-
-		if (instanceCount == 0)
+		else
 		{
 			return;
 		}
+	}
 
+	if (vis.scene->impostors.GetCount() > 0 && pso != nullptr && vis.scene->impostorBuffer.IsValid())
+	{
 		device->EventBegin("RenderImpostors", cmd);
-
-		// Pre-allocate space for all the instances in GPU-buffer:
-		const uint32_t instanceDataSize = sizeof(ShaderMeshInstancePointer);
-		const size_t alloc_size = instanceCount * instanceDataSize;
-		GraphicsDevice::GPUAllocation instances = device->AllocateGPU(alloc_size, cmd);
-
-		uint32_t drawableInstanceCount = 0;
-		for (size_t impostorID = 0; impostorID < vis.scene->impostors.GetCount(); ++impostorID)
-		{
-			const ImpostorComponent& impostor = vis.scene->impostors[impostorID];
-			if (!vis.camera->frustum.CheckBoxFast(impostor.aabb))
-			{
-				continue;
-			}
-
-			for (auto& instanceIndex : impostor.instances)
-			{
-				const AABB& aabb = vis.scene->aabb_objects[instanceIndex];
-				if (!vis.camera->frustum.CheckBoxFast(aabb))
-				{
-					continue;
-				}
-
-				const XMFLOAT3 center = aabb.getCenter();
-				float distance = wi::math::Distance(vis.camera->Eye, center);
-
-				if (distance < impostor.swapInDistance - impostor.fadeThresholdRadius)
-				{
-					continue;
-				}
-
-				float dither = std::max(0.0f, impostor.swapInDistance - distance) / impostor.fadeThresholdRadius;
-
-				// Write into actual GPU-buffer:
-				ShaderMeshInstancePointer* poi = (ShaderMeshInstancePointer*)instances.data + drawableInstanceCount;
-				poi->Create(instanceIndex, uint32_t(impostorID * impostorCaptureAngles * 3), dither);
-
-				drawableInstanceCount++;
-			}
-		}
 
 		device->BindStencilRef(STENCILREF_DEFAULT, cmd);
 		device->BindPipelineState(pso, cmd);
 
-		device->PushConstants(&instances.offset, sizeof(uint), cmd);
-
-		device->BindResource(&instances.buffer, 0, cmd);
+		device->BindIndexBuffer(
+			&vis.scene->impostorBuffer,
+			vis.scene->impostor_ib_format == Format::R32_UINT ? IndexBufferFormat::UINT32 : IndexBufferFormat::UINT16,
+			vis.scene->impostor_ib.offset,
+			cmd
+		);
+		device->BindResource(&vis.scene->impostorBuffer, 0, cmd, vis.scene->impostor_vb.subresource_srv);
+		device->BindResource(&vis.scene->impostorBuffer, 2, cmd, vis.scene->impostor_data.subresource_srv);
 		device->BindResource(&vis.scene->impostorArray, 1, cmd);
 
-		device->Draw(drawableInstanceCount * 6, 0, cmd);
+		device->DrawIndexedInstancedIndirect(&vis.scene->impostorIndirectBuffer, 0, cmd);
 
 		device->EventEnd(cmd);
 	}
@@ -2740,7 +2731,6 @@ void UpdateVisibility(Visibility& vis)
 {
 	// Perform parallel frustum culling and obtain closest reflector:
 	wi::jobsystem::context ctx;
-	wi::jobsystem::context ctx_lights;
 	auto range = wi::profiler::BeginRangeCPU("Frustum Culling");
 
 	assert(vis.scene != nullptr); // User must provide a scene!
@@ -2770,11 +2760,11 @@ void UpdateVisibility(Visibility& vis)
 	{
 		// Cull lights:
 		vis.visibleLights.resize(vis.scene->aabb_lights.GetCount());
-		wi::jobsystem::Dispatch(ctx_lights, (uint32_t)vis.scene->aabb_lights.GetCount(), groupSize, [&](wi::jobsystem::JobArgs args) {
+		wi::jobsystem::Dispatch(ctx, (uint32_t)vis.scene->aabb_lights.GetCount(), groupSize, [&](wi::jobsystem::JobArgs args) {
 
 			// Setup stream compaction:
 			uint32_t& group_count = *(uint32_t*)args.sharedmemory;
-			Visibility::VisibleLight* group_list = (Visibility::VisibleLight*)args.sharedmemory + 1;
+			uint32_t* group_list = (uint32_t*)args.sharedmemory + 1;
 			if (args.isFirstJobInGroup)
 			{
 				group_count = 0; // first thread initializes local counter
@@ -2786,15 +2776,8 @@ void UpdateVisibility(Visibility& vis)
 			{
 				// Local stream compaction:
 				//	(also compute light distance for shadow priority sorting)
-				assert(args.jobIndex < 0xFFFF);
-				group_list[group_count].index = (uint16_t)args.jobIndex;
+				group_list[group_count] = args.jobIndex;
 				const LightComponent& light = vis.scene->lights[args.jobIndex];
-				float distance = 0;
-				if (light.type != LightComponent::DIRECTIONAL)
-				{
-					distance = wi::math::DistanceEstimated(light.position, vis.camera->Eye);
-				}
-				group_list[group_count].distance = uint16_t(distance * 10);
 				group_count++;
 				if (light.IsVolumetricsEnabled())
 				{
@@ -2993,19 +2976,12 @@ void UpdateVisibility(Visibility& vis)
 			});
 	}
 
-	if (vis.flags & Visibility::ALLOW_LIGHTS)
-	{
-		wi::jobsystem::Wait(ctx_lights);
-		vis.visibleLights.resize((size_t)vis.light_counter.load());
-		// Sort lights based on distance so that closer lights will receive shadow map priority:
-		std::sort(vis.visibleLights.begin(), vis.visibleLights.end());
-	}
-
 	wi::jobsystem::Wait(ctx);
 
 	// finalize stream compaction:
 	vis.visibleObjects.resize((size_t)vis.object_counter.load());
 	vis.visibleDecals.resize((size_t)vis.decal_counter.load());
+	vis.visibleLights.resize((size_t)vis.light_counter.load());
 
 	if (vis.scene->weather.IsOceanEnabled())
 	{
@@ -3055,10 +3031,164 @@ void UpdatePerFrameData(
 		voxelSceneData.extents = XMFLOAT3(voxelSceneData.res * voxelSceneData.voxelsize, voxelSceneData.res * voxelSceneData.voxelsize, voxelSceneData.res * voxelSceneData.voxelsize);
 	}
 
+	// Shadow atlas packing:
+	if (!vis.visibleLights.empty())
+	{
+		auto range = wi::profiler::BeginRangeCPU("Shadowmap packing");
+		static thread_local wi::rectpacker::State packer;
+		float iterative_scaling = 1;
+
+		while (iterative_scaling > 0.03f)
+		{
+			packer.clear();
+			for (uint32_t lightIndex : vis.visibleLights)
+			{
+				LightComponent& light = scene.lights[lightIndex];
+				light.shadow_rect = {};
+				if (!light.IsCastingShadow() || light.IsStatic())
+					continue;
+
+				const float dist = wi::math::Distance(vis.camera->Eye, light.position);
+				const float range = light.GetRange();
+				const float amount = std::min(1.0f, range / std::max(0.001f, dist)) * iterative_scaling;
+
+				wi::rectpacker::Rect rect = {};
+				rect.id = int(lightIndex);
+				switch (light.GetType())
+				{
+				case LightComponent::DIRECTIONAL:
+					if (light.forced_shadow_resolution >= 0)
+					{
+						rect.w = light.forced_shadow_resolution * int(CASCADE_COUNT);
+						rect.h = light.forced_shadow_resolution;
+					}
+					else
+					{
+						rect.w = int(max_shadow_resolution_2D * iterative_scaling) * int(CASCADE_COUNT);
+						rect.h = int(max_shadow_resolution_2D * iterative_scaling);
+					}
+					break;
+				case LightComponent::SPOT:
+					if (light.forced_shadow_resolution >= 0)
+					{
+						rect.w = int(light.forced_shadow_resolution);
+						rect.h = int(light.forced_shadow_resolution);
+					}
+					else
+					{
+						rect.w = int(max_shadow_resolution_2D * amount);
+						rect.h = int(max_shadow_resolution_2D * amount);
+					}
+					break;
+				case LightComponent::POINT:
+					if (light.forced_shadow_resolution >= 0)
+					{
+						rect.w = int(light.forced_shadow_resolution) * 6;
+						rect.h = int(light.forced_shadow_resolution);
+					}
+					else
+					{
+						rect.w = int(max_shadow_resolution_cube * amount) * 6;
+						rect.h = int(max_shadow_resolution_cube * amount);
+					}
+					break;
+				}
+				if (rect.w > 8 && rect.h > 8)
+				{
+					packer.add_rect(rect);
+				}
+			}
+			if (!packer.rects.empty())
+			{
+				if (packer.pack(8192))
+				{
+					for (auto& rect : packer.rects)
+					{
+						uint32_t lightIndex = uint32_t(rect.id);
+						LightComponent& light = scene.lights[lightIndex];
+						if (rect.was_packed)
+						{
+							light.shadow_rect = rect;
+
+							// Remove slice multipliers from rect:
+							switch (light.GetType())
+							{
+							case LightComponent::DIRECTIONAL:
+								light.shadow_rect.w /= int(CASCADE_COUNT);
+								break;
+							case LightComponent::POINT:
+								light.shadow_rect.w /= 6;
+								break;
+							}
+						}
+						else
+						{
+							light.direction = {};
+						}
+					}
+
+					if ((int)shadowMapAtlas.desc.width < packer.width || (int)shadowMapAtlas.desc.height < packer.height)
+					{
+						TextureDesc desc;
+						desc.width = uint32_t(packer.width);
+						desc.height = uint32_t(packer.height);
+						desc.format = Format::R16_TYPELESS;
+						desc.bind_flags = BindFlag::DEPTH_STENCIL | BindFlag::SHADER_RESOURCE;
+						desc.layout = ResourceState::SHADER_RESOURCE;
+						device->CreateTexture(&desc, nullptr, &shadowMapAtlas);
+						device->SetName(&shadowMapAtlas, "shadowMapAtlas");
+
+						desc.format = Format::R16G16B16A16_FLOAT;
+						desc.bind_flags = BindFlag::RENDER_TARGET | BindFlag::SHADER_RESOURCE;
+						desc.layout = ResourceState::SHADER_RESOURCE;
+						desc.clear.color[0] = 1;
+						desc.clear.color[1] = 1;
+						desc.clear.color[2] = 1;
+						desc.clear.color[3] = 0;
+						device->CreateTexture(&desc, nullptr, &shadowMapAtlas_Transparent);
+						device->SetName(&shadowMapAtlas_Transparent, "shadowMapAtlas_Transparent");
+
+
+						RenderPassDesc renderpassdesc;
+						renderpassdesc.attachments.push_back(
+							RenderPassAttachment::DepthStencil(
+								&shadowMapAtlas,
+								RenderPassAttachment::LoadOp::CLEAR,
+								RenderPassAttachment::StoreOp::STORE,
+								ResourceState::SHADER_RESOURCE,
+								ResourceState::DEPTHSTENCIL,
+								ResourceState::SHADER_RESOURCE
+							)
+						);
+						renderpassdesc.attachments.push_back(
+							RenderPassAttachment::RenderTarget(
+								&shadowMapAtlas_Transparent,
+								RenderPassAttachment::LoadOp::CLEAR,
+								RenderPassAttachment::StoreOp::STORE,
+								ResourceState::SHADER_RESOURCE,
+								ResourceState::RENDERTARGET,
+								ResourceState::SHADER_RESOURCE
+							)
+						);
+						device->CreateRenderPass(&renderpassdesc, &renderpass_shadowMapAtlas);
+					}
+
+					break;
+				}
+				else
+				{
+					iterative_scaling *= 0.5f;
+				}
+			}
+			else
+			{
+				iterative_scaling = 0.0; //PE: fix - endless loop if some lights do not have shadows.
+			}
+		}
+		wi::profiler::EndRange(range);
+	}
+
 	// Update CPU-side frame constant buffer:
-	frameCB.shadow_cascade_count = CASCADE_COUNT;
-	frameCB.shadow_kernel_2D = 1.0f / SHADOWRES_2D;
-	frameCB.shadow_kernel_cube = 1.0f / SHADOWRES_CUBE;
 	frameCB.delta_time = dt * GetGameSpeed();
 	frameCB.time_previous = frameCB.time;
 	frameCB.time += frameCB.delta_time;
@@ -3069,7 +3199,7 @@ void UpdatePerFrameData(
 	frameCB.voxelradiance_size = voxelSceneData.voxelsize;
 	frameCB.voxelradiance_size_rcp = 1.0f / (float)frameCB.voxelradiance_size;
 	frameCB.voxelradiance_resolution = GetVoxelRadianceEnabled() ? (uint)voxelSceneData.res : 0;
-	frameCB.voxelradiance_resolution_rcp = 1.0f / (float)frameCB.voxelradiance_resolution;
+	frameCB.voxelradiance_resolution_rcp = GetVoxelRadianceEnabled() ? 1.0f / (float)frameCB.voxelradiance_resolution : 0; //PE: was inf.
 	frameCB.voxelradiance_mipcount = voxelSceneData.mips;
 	frameCB.voxelradiance_numcones = std::max(std::min(voxelSceneData.numCones, 16u), 1u);
 	frameCB.voxelradiance_numcones_rcp = 1.0f / (float)frameCB.voxelradiance_numcones;
@@ -3193,13 +3323,17 @@ void UpdatePerFrameData(
 	frameCB.texture_transmittancelut_index = device->GetDescriptorIndex(&textures[TEXTYPE_2D_SKYATMOSPHERE_TRANSMITTANCELUT], SubresourceType::SRV);
 	frameCB.texture_multiscatteringlut_index = device->GetDescriptorIndex(&textures[TEXTYPE_2D_SKYATMOSPHERE_MULTISCATTEREDLUMINANCELUT], SubresourceType::SRV);
 	frameCB.texture_skyluminancelut_index = device->GetDescriptorIndex(&textures[TEXTYPE_2D_SKYATMOSPHERE_SKYLUMINANCELUT], SubresourceType::SRV);
-	frameCB.texture_shadowarray_2d_index = device->GetDescriptorIndex(&shadowMapArray_2D, SubresourceType::SRV);
-	frameCB.texture_shadowarray_cube_index = device->GetDescriptorIndex(&shadowMapArray_Cube, SubresourceType::SRV);
-	frameCB.texture_shadowarray_transparent_2d_index = device->GetDescriptorIndex(&shadowMapArray_Transparent_2D, SubresourceType::SRV);
-	frameCB.texture_shadowarray_transparent_cube_index = device->GetDescriptorIndex(&shadowMapArray_Transparent_Cube, SubresourceType::SRV);
 	frameCB.texture_voxelgi_index = device->GetDescriptorIndex(GetVoxelRadianceSecondaryBounceEnabled() ? &textures[TEXTYPE_3D_VOXELRADIANCE_HELPER] : &textures[TEXTYPE_3D_VOXELRADIANCE], SubresourceType::SRV);
 	frameCB.buffer_entityarray_index = device->GetDescriptorIndex(&resourceBuffers[RBTYPE_ENTITYARRAY], SubresourceType::SRV);
 	frameCB.buffer_entitymatrixarray_index = device->GetDescriptorIndex(&resourceBuffers[RBTYPE_MATRIXARRAY], SubresourceType::SRV);
+
+	frameCB.shadow_cascade_count = CASCADE_COUNT;
+	frameCB.texture_shadowatlas_index = device->GetDescriptorIndex(&shadowMapAtlas, SubresourceType::SRV);
+	frameCB.texture_shadowatlas_transparent_index = device->GetDescriptorIndex(&shadowMapAtlas_Transparent, SubresourceType::SRV);
+	frameCB.shadow_atlas_resolution.x = shadowMapAtlas.desc.width;
+	frameCB.shadow_atlas_resolution.y = shadowMapAtlas.desc.height;
+	frameCB.shadow_atlas_resolution_rcp.x = 1.0f / frameCB.shadow_atlas_resolution.x;
+	frameCB.shadow_atlas_resolution_rcp.y = 1.0f / frameCB.shadow_atlas_resolution.y;
 
 
 	// Create volumetric cloud static resources if needed:
@@ -3363,8 +3497,8 @@ void UpdateRenderData(
 			shaderentity.SetType(ENTITY_TYPE_DECAL);
 			shaderentity.position = decal.position;
 			shaderentity.SetRange(decal.range);
-			shaderentity.color = wi::math::CompressColor(XMFLOAT4(decal.color.x, decal.color.y, decal.color.z, decal.GetOpacity()));
-			shaderentity.SetEnergy(decal.emissive);
+			float emissive_mul = 1 + decal.emissive;
+			shaderentity.SetColor(float4(decal.color.x * emissive_mul, decal.color.y * emissive_mul, decal.color.z * emissive_mul, decal.color.w));
 
 			shaderentity.SetIndices(matrixCounter, 0);
 			shadermatrix = XMMatrixInverse(nullptr, XMLoadFloat4x4(&decal.world));
@@ -3435,9 +3569,8 @@ void UpdateRenderData(
 		}
 
 		// Write lights into entity array:
-		uint32_t shadowCounter_2D = SHADOWRES_2D > 0 ? 0 : SHADOWCOUNT_2D;
-		uint32_t shadowCounter_Cube = SHADOWRES_CUBE > 0 ? 0 : SHADOWCOUNT_CUBE;
-		for (auto visibleLight : vis.visibleLights)
+		const XMFLOAT2 atlas_dim_rcp = XMFLOAT2(1.0f / float(shadowMapAtlas.desc.width), 1.0f / float(shadowMapAtlas.desc.height));
+		for (uint32_t lightIndex : vis.visibleLights)
 		{
 			if (entityCounter == SHADER_ENTITY_COUNT)
 			{
@@ -3447,7 +3580,6 @@ void UpdateRenderData(
 			}
 			ShaderEntity shaderentity = {};
 
-			uint16_t lightIndex = visibleLight.index;
 			const LightComponent& light = vis.scene->lights[lightIndex];
 
 			shaderentity.layerMask = ~0u;
@@ -3462,8 +3594,7 @@ void UpdateRenderData(
 			shaderentity.SetType(light.GetType());
 			shaderentity.position = light.position;
 			shaderentity.SetRange(light.GetRange());
-			shaderentity.color = wi::math::CompressColor(light.color);
-			shaderentity.SetEnergy(light.energy);
+			shaderentity.SetColor(float4(light.color.x * light.intensity, light.color.y * light.intensity, light.color.z * light.intensity, 1));
 
 			// mark as no shadow by default:
 			shaderentity.indices = ~0;
@@ -3479,30 +3610,11 @@ void UpdateRenderData(
 				shadow = light.IsCastingShadow() && !light.IsStatic();
 				if (shadow)
 				{
-					switch (light.GetType())
-					{
-					case LightComponent::DIRECTIONAL:
-						if (shadowCounter_2D < SHADOWCOUNT_2D - CASCADE_COUNT + 1)
-						{
-							shaderentity.SetIndices(matrixCounter, shadowCounter_2D);
-							shadowCounter_2D += CASCADE_COUNT;
-						}
-						break;
-					case LightComponent::SPOT:
-						if (shadowCounter_2D < SHADOWCOUNT_2D)
-						{
-							shaderentity.SetIndices(matrixCounter, shadowCounter_2D);
-							shadowCounter_2D += 1;
-						}
-						break;
-					default:
-						if (shadowCounter_Cube < SHADOWCOUNT_CUBE)
-						{
-							shaderentity.SetIndices(matrixCounter, shadowCounter_Cube);
-							shadowCounter_Cube += 1;
-						}
-						break;
-					}
+					shaderentity.shadowAtlasMulAdd.x = light.shadow_rect.w * atlas_dim_rcp.x;
+					shaderentity.shadowAtlasMulAdd.y = light.shadow_rect.h * atlas_dim_rcp.y;
+					shaderentity.shadowAtlasMulAdd.z = light.shadow_rect.x * atlas_dim_rcp.x;
+					shaderentity.shadowAtlasMulAdd.w = light.shadow_rect.y * atlas_dim_rcp.y;
+					shaderentity.SetIndices(matrixCounter, 0);
 				}
 			}
 
@@ -3514,8 +3626,8 @@ void UpdateRenderData(
 
 				if (shadow)
 				{
-					std::array<SHCAM, CASCADE_COUNT> shcams;
-					CreateDirLightShadowCams(light, *vis.camera, shcams);
+					SHCAM shcams[CASCADE_COUNT];
+					CreateDirLightShadowCams(light, *vis.camera, shcams, arraysize(shcams));
 					std::memcpy(&matrixArray[matrixCounter++], &shcams[0].view_projection, sizeof(XMMATRIX));
 					std::memcpy(&matrixArray[matrixCounter++], &shcams[1].view_projection, sizeof(XMMATRIX));
 					std::memcpy(&matrixArray[matrixCounter++], &shcams[2].view_projection, sizeof(XMMATRIX));
@@ -3538,7 +3650,18 @@ void UpdateRenderData(
 			break;
 			case LightComponent::SPOT:
 			{
-				shaderentity.SetConeAngleCos(cosf(light.fov * 0.5f));
+				const float outerConeAngle = light.outerConeAngle;
+				const float innerConeAngle = std::min(light.innerConeAngle, outerConeAngle);
+				const float outerConeAngleCos = std::cos(outerConeAngle);
+				const float innerConeAngleCos = std::cos(innerConeAngle);
+
+				// https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_lights_punctual#inner-and-outer-cone-angles
+				const float lightAngleScale = 1.0f / std::max(0.001f, innerConeAngleCos - outerConeAngleCos);
+				const float lightAngleOffset = -outerConeAngleCos * lightAngleScale;
+
+				shaderentity.SetConeAngleCos(outerConeAngleCos);
+				shaderentity.SetAngleScale(lightAngleScale);
+				shaderentity.SetAngleOffset(lightAngleOffset);
 				shaderentity.SetDirection(light.direction);
 
 				if (shadow)
@@ -3584,9 +3707,8 @@ void UpdateRenderData(
 
 			shaderentity.SetType(force.type);
 			shaderentity.position = force.position;
-			shaderentity.SetEnergy(force.gravity);
-			shaderentity.SetRange(1.0f / std::max(0.0001f, force.GetRange())); // avoid division in shader
-			shaderentity.SetConeAngleCos(force.GetRange()); // this will be the real range in the less common shaders...
+			shaderentity.SetGravity(force.gravity);
+			shaderentity.SetRange(std::max(0.001f, force.GetRange()));
 			// The default planar force field is facing upwards, and thus the pull direction is downwards:
 			shaderentity.SetDirection(force.direction);
 
@@ -3638,14 +3760,16 @@ void UpdateRenderData(
 		const SoftBodyPhysicsComponent& softbody = vis.scene->softbodies[i];
 
 		const MeshComponent* mesh = vis.scene->meshes.GetComponent(entity);
-		if (mesh != nullptr && mesh->streamoutBuffer.IsValid())
+		if (mesh != nullptr && mesh->streamoutBuffer.IsValid() && !softbody.vertex_positions_simulation.empty())
 		{
 			GraphicsDevice::GPUAllocation allocation = device->AllocateGPU(mesh->so_pos_nor_wind.size + mesh->so_tan.size, cmd);
 			std::memcpy(allocation.data, softbody.vertex_positions_simulation.data(), mesh->so_pos_nor_wind.size);
-			std::memcpy((uint8_t*)allocation.data + mesh->so_pos_nor_wind.size, softbody.vertex_tangents_simulation.data(), mesh->so_tan.size);
 			device->CopyBuffer(&mesh->streamoutBuffer, mesh->so_pos_nor_wind.offset, &allocation.buffer, allocation.offset, mesh->so_pos_nor_wind.size, cmd);
-			device->CopyBuffer(&mesh->streamoutBuffer, mesh->so_tan.offset, &allocation.buffer, allocation.offset + mesh->so_pos_nor_wind.size, mesh->so_tan.size, cmd);
-
+			if (!softbody.vertex_tangents_simulation.empty())
+			{
+				std::memcpy((uint8_t*)allocation.data + mesh->so_pos_nor_wind.size, softbody.vertex_tangents_simulation.data(), mesh->so_tan.size);
+				device->CopyBuffer(&mesh->streamoutBuffer, mesh->so_tan.offset, &allocation.buffer, allocation.offset + mesh->so_pos_nor_wind.size, mesh->so_tan.size, cmd);
+			}
 			barrier_stack.push_back(GPUBarrier::Buffer(&mesh->streamoutBuffer, ResourceState::COPY_DST, ResourceState::SHADER_RESOURCE));
 		}
 	}
@@ -3734,8 +3858,46 @@ void UpdateRenderData(
 		wi::profiler::EndRange(range);
 	}
 
+	// Impostor prepare:
+	if (vis.scene->instanceArraySize > 0 && vis.scene->meshletBuffer.IsValid())
+	{
+		device->EventBegin("Impostor prepare", cmd);
+		auto range = wi::profiler::BeginRangeGPU("Impostor prepare", cmd);
+
+		barrier_stack.push_back(GPUBarrier::Buffer(&vis.scene->impostorIndirectBuffer, ResourceState::INDIRECT_ARGUMENT, ResourceState::COPY_DST));
+		barrier_stack_flush(cmd);
+		IndirectDrawArgsIndexedInstanced clear_indirect = {};
+		clear_indirect.index_count_per_instance = 0;
+		clear_indirect.instance_count = 1;
+		clear_indirect.start_index_location = 0;
+		clear_indirect.base_vertex_location = 0;
+		clear_indirect.start_instance_location = 0;
+		device->UpdateBuffer(&vis.scene->impostorIndirectBuffer, &clear_indirect, cmd, sizeof(clear_indirect), 0);
+		barrier_stack.push_back(GPUBarrier::Buffer(&vis.scene->impostorIndirectBuffer, ResourceState::COPY_DST, ResourceState::UNORDERED_ACCESS));
+		barrier_stack.push_back(GPUBarrier::Buffer(&vis.scene->impostorBuffer, ResourceState::SHADER_RESOURCE, ResourceState::UNORDERED_ACCESS));
+		barrier_stack_flush(cmd);
+
+		device->BindComputeShader(&shaders[CSTYPE_IMPOSTOR_PREPARE], cmd);
+		device->BindUAV(&vis.scene->impostorBuffer, 0, cmd, vis.scene->impostor_ib.subresource_uav);
+		device->BindUAV(&vis.scene->impostorBuffer, 1, cmd, vis.scene->impostor_vb.subresource_uav);
+		device->BindUAV(&vis.scene->impostorBuffer, 2, cmd, vis.scene->impostor_data.subresource_uav);
+		device->BindUAV(&vis.scene->impostorIndirectBuffer, 3, cmd);
+
+		uint object_count = (uint)vis.scene->objects.GetCount();
+		device->PushConstants(&object_count, sizeof(object_count), cmd);
+
+		device->Dispatch((object_count + 63u) / 64u, 1, 1, cmd);
+
+		barrier_stack.push_back(GPUBarrier::Buffer(&vis.scene->impostorBuffer, ResourceState::UNORDERED_ACCESS, ResourceState::SHADER_RESOURCE));
+		barrier_stack.push_back(GPUBarrier::Buffer(&vis.scene->impostorIndirectBuffer,ResourceState::UNORDERED_ACCESS, ResourceState::INDIRECT_ARGUMENT));
+		barrier_stack_flush(cmd);
+
+		wi::profiler::EndRange(range);
+		device->EventEnd(cmd);
+	}
+
 	// Meshlets:
-	if(vis.scene->instanceArraySize > 0)
+	if(vis.scene->instanceArraySize > 0 && vis.scene->meshletBuffer.IsValid())
 	{
 		device->EventBegin("Meshlet prepare", cmd);
 		auto range = wi::profiler::BeginRangeGPU("Meshlet prepare", cmd);
@@ -4056,7 +4218,7 @@ void OcclusionCulling_Reset(const Visibility& vis, CommandList cmd)
 	{
 		return;
 	}
-	if (vis.visibleObjects.empty() && vis.visibleLights.empty())
+	if (vis.visibleObjects.empty() && vis.visibleLights.empty() && !vis.scene->weather.IsOceanEnabled())
 	{
 		return;
 	}
@@ -4077,7 +4239,7 @@ void OcclusionCulling_Render(const CameraComponent& camera, const Visibility& vi
 	{
 		return;
 	}
-	if (vis.visibleObjects.empty() && vis.visibleLights.empty())
+	if (vis.visibleObjects.empty() && vis.visibleLights.empty() && !vis.scene->weather.IsOceanEnabled())
 	{
 		return;
 	}
@@ -4120,9 +4282,8 @@ void OcclusionCulling_Render(const CameraComponent& camera, const Visibility& vi
 	{
 		device->EventBegin("Occlusion Culling Lights", cmd);
 
-		for (auto& x : vis.visibleLights)
+		for (uint32_t lightIndex : vis.visibleLights)
 		{
-			const uint32_t lightIndex = x.index;
 			const LightComponent& light = vis.scene->lights[lightIndex];
 			if (light.occlusionquery >= 0)
 			{
@@ -4171,7 +4332,7 @@ void OcclusionCulling_Resolve(const Visibility& vis, CommandList cmd)
 	{
 		return;
 	}
-	if (vis.visibleObjects.empty() && vis.visibleLights.empty())
+	if (vis.visibleObjects.empty() && vis.visibleLights.empty() && !vis.scene->weather.IsOceanEnabled())
 	{
 		return;
 	}
@@ -4307,23 +4468,22 @@ void DrawLightVisualizers(
 		{
 			device->BindPipelineState(&PSO_lightvisualizer[type], cmd);
 
-			for (auto visibleLight : vis.visibleLights)
+			for (uint32_t lightIndex : vis.visibleLights)
 			{
-				uint16_t lightIndex = visibleLight.index;
 				const LightComponent& light = vis.scene->lights[lightIndex];
 
 				if (light.GetType() == type && light.IsVisualizerEnabled())
 				{
 
 					VolumeLightCB lcb;
-					lcb.lightColor = XMFLOAT4(light.color.x, light.color.y, light.color.z, 1);
-					lcb.lightEnerdis = XMFLOAT4(light.energy, light.GetRange(), light.fov, light.energy);
+					lcb.xLightColor = XMFLOAT4(light.color.x, light.color.y, light.color.z, 1);
+					lcb.xLightEnerdis = XMFLOAT4(light.intensity, light.GetRange(), light.outerConeAngle, light.intensity);
 
 					if (type == LightComponent::POINT)
 					{
-						lcb.lightEnerdis.w = light.GetRange()*light.energy*0.01f; // scale
-						XMStoreFloat4x4(&lcb.lightWorld, 
-							XMMatrixScaling(lcb.lightEnerdis.w, lcb.lightEnerdis.w, lcb.lightEnerdis.w)*
+						lcb.xLightEnerdis.w = light.GetRange() * 0.025f; // scale
+						XMStoreFloat4x4(&lcb.xLightWorld,
+							XMMatrixScaling(lcb.xLightEnerdis.w, lcb.xLightEnerdis.w, lcb.xLightEnerdis.w)*
 							camrot*
 							XMMatrixTranslationFromVector(XMLoadFloat3(&light.position))
 						);
@@ -4334,10 +4494,25 @@ void DrawLightVisualizers(
 					}
 					else if (type == LightComponent::SPOT)
 					{
-						float coneS = (float)(light.fov / 0.7853981852531433);
-						lcb.lightEnerdis.w = light.GetRange()*light.energy*0.03f; // scale
-						XMStoreFloat4x4(&lcb.lightWorld, 
-							XMMatrixScaling(coneS*lcb.lightEnerdis.w, lcb.lightEnerdis.w, coneS*lcb.lightEnerdis.w)*
+						if (light.innerConeAngle > 0)
+						{
+							float coneS = (float)(std::min(light.innerConeAngle, light.outerConeAngle) * 2 / XM_PIDIV4);
+							lcb.xLightEnerdis.w = light.GetRange() * 0.1f; // scale
+							XMStoreFloat4x4(&lcb.xLightWorld,
+								XMMatrixScaling(coneS * lcb.xLightEnerdis.w, lcb.xLightEnerdis.w, coneS * lcb.xLightEnerdis.w) *
+								XMMatrixRotationQuaternion(XMLoadFloat4(&light.rotation)) *
+								XMMatrixTranslationFromVector(XMLoadFloat3(&light.position))
+							);
+
+							device->BindDynamicConstantBuffer(lcb, CB_GETBINDSLOT(VolumeLightCB), cmd);
+
+							device->Draw(192, 0, cmd); // cone
+						}
+
+						float coneS = (float)(light.outerConeAngle * 2 / XM_PIDIV4);
+						lcb.xLightEnerdis.w = light.GetRange() * 0.1f; // scale
+						XMStoreFloat4x4(&lcb.xLightWorld,
+							XMMatrixScaling(coneS*lcb.xLightEnerdis.w, lcb.xLightEnerdis.w, coneS*lcb.xLightEnerdis.w)*
 							XMMatrixRotationQuaternion(XMLoadFloat4(&light.rotation))*
 							XMMatrixTranslationFromVector(XMLoadFloat3(&light.position))
 						);
@@ -4382,7 +4557,7 @@ void DrawVolumeLights(
 
 			for (size_t i = 0; i < vis.visibleLights.size(); ++i)
 			{
-				const uint32_t lightIndex = vis.visibleLights[i].index;
+				const uint32_t lightIndex = vis.visibleLights[i];
 				const LightComponent& light = vis.scene->lights[lightIndex];
 				if (light.GetType() == type && light.IsVolumetricsEnabled())
 				{
@@ -4413,7 +4588,7 @@ void DrawVolumeLights(
 					{
 						MiscCB miscCb;
 						miscCb.g_xColor.x = float(i);
-						const float coneS = (const float)(light.fov / XM_PIDIV4);
+						const float coneS = (const float)(light.outerConeAngle * 2 / XM_PIDIV4);
 						XMStoreFloat4x4(&miscCb.g_xTransform, 
 							XMMatrixScaling(coneS*light.GetRange(), light.GetRange(), coneS*light.GetRange())*
 							XMMatrixRotationQuaternion(XMLoadFloat4(&light.rotation))*
@@ -4450,9 +4625,8 @@ void DrawLensFlares(
 
 	BindCommonResources(cmd);
 
-	for (auto visibleLight : vis.visibleLights)
+	for (uint32_t lightIndex : vis.visibleLights)
 	{
-		uint16_t lightIndex = visibleLight.index;
 		const LightComponent& light = vis.scene->lights[lightIndex];
 
 		if (!light.lensFlareRimTextures.empty())
@@ -4528,158 +4702,15 @@ void DrawLensFlares(
 }
 
 
-void SetShadowProps2D(int resolution, int count)
+void SetShadowProps2D(int resolution)
 {
-	if (resolution >= 0)
-	{
-		SHADOWRES_2D = resolution;
-	}
-	if (count >= 0)
-	{
-		SHADOWCOUNT_2D = count;
-	}
-
-	if (SHADOWCOUNT_2D > 0 && SHADOWRES_2D > 0)
-	{
-		TextureDesc desc;
-		desc.width = SHADOWRES_2D;
-		desc.height = SHADOWRES_2D;
-		desc.mip_levels = 1;
-		desc.array_size = SHADOWCOUNT_2D;
-		desc.sample_count = 1;
-		desc.usage = Usage::DEFAULT;
-
-		desc.bind_flags = BindFlag::DEPTH_STENCIL | BindFlag::SHADER_RESOURCE;
-		desc.format = Format::R16_TYPELESS;
-		desc.layout = ResourceState::SHADER_RESOURCE;
-		device->CreateTexture(&desc, nullptr, &shadowMapArray_2D);
-
-		desc.bind_flags = BindFlag::RENDER_TARGET | BindFlag::SHADER_RESOURCE;
-		desc.format = Format::R16G16B16A16_FLOAT;
-		desc.layout = ResourceState::SHADER_RESOURCE;
-		desc.clear.color[0] = 1;
-		desc.clear.color[1] = 1;
-		desc.clear.color[2] = 1;
-		desc.clear.color[3] = 0;
-		device->CreateTexture(&desc, nullptr, &shadowMapArray_Transparent_2D);
-
-		renderpasses_shadow2D.resize(SHADOWCOUNT_2D);
-
-		for (uint32_t i = 0; i < SHADOWCOUNT_2D; ++i)
-		{
-			int subresource_index;
-			subresource_index = device->CreateSubresource(&shadowMapArray_2D, SubresourceType::DSV, i, 1, 0, 1);
-			assert(subresource_index == i);
-			subresource_index = device->CreateSubresource(&shadowMapArray_Transparent_2D, SubresourceType::RTV, i, 1, 0, 1);
-			assert(subresource_index == i);
-
-			RenderPassDesc renderpassdesc;
-
-			renderpassdesc.attachments.push_back(
-				RenderPassAttachment::DepthStencil(
-					&shadowMapArray_2D,
-					RenderPassAttachment::LoadOp::CLEAR,
-					RenderPassAttachment::StoreOp::STORE,
-					ResourceState::SHADER_RESOURCE,
-					ResourceState::DEPTHSTENCIL,
-					ResourceState::SHADER_RESOURCE
-				)
-			);
-			renderpassdesc.attachments.back().subresource = subresource_index;
-
-			renderpassdesc.attachments.push_back(
-				RenderPassAttachment::RenderTarget(
-					&shadowMapArray_Transparent_2D,
-					RenderPassAttachment::LoadOp::CLEAR,
-					RenderPassAttachment::StoreOp::STORE,
-					ResourceState::SHADER_RESOURCE,
-					ResourceState::RENDERTARGET,
-					ResourceState::SHADER_RESOURCE
-				)
-			);
-			renderpassdesc.attachments.back().subresource = subresource_index;
-
-			device->CreateRenderPass(&renderpassdesc, &renderpasses_shadow2D[subresource_index]);
-		}
-	}
-
+	max_shadow_resolution_2D = resolution;
 }
-void SetShadowPropsCube(int resolution, int count)
+void SetShadowPropsCube(int resolution)
 {
-	if (resolution >= 0)
-	{
-		SHADOWRES_CUBE = resolution;
-	}
-	if (count >= 0)
-	{
-		SHADOWCOUNT_CUBE = count;
-	}
-
-	if (SHADOWCOUNT_CUBE > 0 && SHADOWRES_CUBE > 0)
-	{
-		TextureDesc desc;
-		desc.width = SHADOWRES_CUBE;
-		desc.height = SHADOWRES_CUBE;
-		desc.mip_levels = 1;
-		desc.array_size = 6 * SHADOWCOUNT_CUBE;
-		desc.sample_count = 1;
-		desc.usage = Usage::DEFAULT;
-		desc.misc_flags = ResourceMiscFlag::TEXTURECUBE;
-
-		desc.bind_flags = BindFlag::DEPTH_STENCIL | BindFlag::SHADER_RESOURCE;
-		desc.format = Format::R16_TYPELESS;
-		desc.layout = ResourceState::SHADER_RESOURCE;
-		device->CreateTexture(&desc, nullptr, &shadowMapArray_Cube);
-
-		desc.bind_flags = BindFlag::RENDER_TARGET | BindFlag::SHADER_RESOURCE;
-		desc.format = Format::R16G16B16A16_FLOAT;
-		desc.layout = ResourceState::SHADER_RESOURCE;
-		desc.clear.color[0] = 1;
-		desc.clear.color[1] = 1;
-		desc.clear.color[2] = 1;
-		desc.clear.color[3] = 0;
-		device->CreateTexture(&desc, nullptr, &shadowMapArray_Transparent_Cube);
-
-		renderpasses_shadowCube.resize(SHADOWCOUNT_CUBE);
-
-		for (uint32_t i = 0; i < SHADOWCOUNT_CUBE; ++i)
-		{
-			int subresource_index;
-			subresource_index = device->CreateSubresource(&shadowMapArray_Cube, SubresourceType::DSV, i * 6, 6, 0, 1);
-			assert(subresource_index == i);
-			subresource_index = device->CreateSubresource(&shadowMapArray_Transparent_Cube, SubresourceType::RTV, i * 6, 6, 0, 1);
-			assert(subresource_index == i);
-
-			RenderPassDesc renderpassdesc;
-			renderpassdesc.attachments.push_back(
-				RenderPassAttachment::DepthStencil(
-					&shadowMapArray_Cube,
-					RenderPassAttachment::LoadOp::CLEAR,
-					RenderPassAttachment::StoreOp::STORE,
-					ResourceState::SHADER_RESOURCE,
-					ResourceState::DEPTHSTENCIL,
-					ResourceState::SHADER_RESOURCE
-				)
-			);
-			renderpassdesc.attachments.back().subresource = subresource_index;
-
-			renderpassdesc.attachments.push_back(
-				RenderPassAttachment::RenderTarget(
-					&shadowMapArray_Transparent_Cube,
-					RenderPassAttachment::LoadOp::CLEAR,
-					RenderPassAttachment::StoreOp::STORE,
-					ResourceState::SHADER_RESOURCE,
-					ResourceState::RENDERTARGET,
-					ResourceState::SHADER_RESOURCE
-				)
-			);
-			renderpassdesc.attachments.back().subresource = subresource_index;
-
-			device->CreateRenderPass(&renderpassdesc, &renderpasses_shadowCube[subresource_index]);
-		}
-	}
-
+	max_shadow_resolution_cube = resolution;
 }
+
 void DrawShadowmaps(
 	const Visibility& vis,
 	CommandList cmd
@@ -4688,10 +4719,11 @@ void DrawShadowmaps(
 	if (IsWireRender())
 		return;
 
-	if (!vis.visibleLights.empty())
+	if (!vis.visibleLights.empty() && renderpass_shadowMapAtlas.IsValid())
 	{
 		device->EventBegin("DrawShadowmaps", cmd);
-		auto range = wi::profiler::BeginRangeGPU("Shadow Rendering", cmd);
+		auto range_cpu = wi::profiler::BeginRangeCPU("Shadowmap Rendering");
+		auto range_gpu = wi::profiler::BeginRangeGPU("Shadowmap Rendering", cmd);
 
 		const bool predicationRequest =
 			device->CheckCapability(GraphicsDeviceCapability::PREDICATION) &&
@@ -4705,20 +4737,12 @@ void DrawShadowmaps(
 		cam_frustum.Transform(cam_frustum, vis.camera->GetInvView());
 		XMStoreFloat4(&cam_frustum.Orientation, XMQuaternionNormalize(XMLoadFloat4(&cam_frustum.Orientation)));
 
-
-		uint32_t shadowCounter_2D = SHADOWRES_2D > 0 ? 0 : SHADOWCOUNT_2D;
-		uint32_t shadowCounter_Cube = SHADOWRES_CUBE > 0 ? 0 : SHADOWCOUNT_CUBE;
-
 		static thread_local RenderQueue renderQueue;
 
-		for (const auto& visibleLight : vis.visibleLights)
-		{
-			if (shadowCounter_2D >= SHADOWCOUNT_2D && shadowCounter_Cube >= SHADOWCOUNT_CUBE)
-			{
-				break;
-			}
+		device->RenderPassBegin(&renderpass_shadowMapAtlas, cmd);
 
-			uint16_t lightIndex = visibleLight.index;
+		for (uint32_t lightIndex : vis.visibleLights)
+		{
 			const LightComponent& light = vis.scene->lights[lightIndex];
 			
 			bool shadow = light.IsCastingShadow() && !light.IsStatic();
@@ -4731,13 +4755,8 @@ void DrawShadowmaps(
 			{
 			case LightComponent::DIRECTIONAL:
 			{
-				if (shadowCounter_2D >= SHADOWCOUNT_2D - CASCADE_COUNT + 1)
-					break;
-				uint32_t slice = shadowCounter_2D;
-				shadowCounter_2D += CASCADE_COUNT;
-
-				std::array<SHCAM, CASCADE_COUNT> shcams;
-				CreateDirLightShadowCams(light, *vis.camera, shcams);
+				SHCAM shcams[CASCADE_COUNT];
+				CreateDirLightShadowCams(light, *vis.camera, shcams, arraysize(shcams));
 
 				for (uint32_t cascade = 0; cascade < CASCADE_COUNT; ++cascade)
 				{
@@ -4753,7 +4772,7 @@ void DrawShadowmaps(
 							{
 								Entity cullable_entity = vis.scene->aabb_objects.GetEntity(i);
 
-								renderQueue.add(object.mesh_index, i, 0);
+								renderQueue.add(object.mesh_index, uint32_t(i), 0);
 
 								if (object.GetRenderTypes() & RENDERTYPE_TRANSPARENT || object.GetRenderTypes() & RENDERTYPE_WATER)
 								{
@@ -4763,7 +4782,6 @@ void DrawShadowmaps(
 						}
 					}
 
-					device->RenderPassBegin(&renderpasses_shadow2D[slice + cascade], cmd);
 					if (!renderQueue.empty())
 					{
 						CameraCB cb;
@@ -4771,10 +4789,10 @@ void DrawShadowmaps(
 						device->BindDynamicConstantBuffer(cb, CBSLOT_RENDERER_CAMERA, cmd);
 
 						Viewport vp;
-						vp.top_left_x = 0;
-						vp.top_left_y = 0;
-						vp.width = (float)SHADOWRES_2D;
-						vp.height = (float)SHADOWRES_2D;
+						vp.top_left_x = float(light.shadow_rect.x + cascade * light.shadow_rect.w);
+						vp.top_left_y = float(light.shadow_rect.y);
+						vp.width = float(light.shadow_rect.w);
+						vp.height = float(light.shadow_rect.h);
 						vp.min_depth = 0.0f;
 						vp.max_depth = 1.0f;
 						device->BindViewports(1, &vp, cmd);
@@ -4785,18 +4803,12 @@ void DrawShadowmaps(
 							RenderMeshes(vis, renderQueue, RENDERPASS_SHADOW, RENDERTYPE_TRANSPARENT | RENDERTYPE_WATER, cmd);
 						}
 					}
-					device->RenderPassEnd(cmd);
 
 				}
 			}
 			break;
 			case LightComponent::SPOT:
 			{
-				if (shadowCounter_2D >= SHADOWCOUNT_2D)
-					break;
-				uint32_t slice = shadowCounter_2D;
-				shadowCounter_2D += 1;
-
 				SHCAM shcam;
 				CreateSpotLightShadowCam(light, shcam);
 				if (!cam_frustum.Intersects(shcam.boundingfrustum))
@@ -4814,7 +4826,7 @@ void DrawShadowmaps(
 						{
 							Entity cullable_entity = vis.scene->aabb_objects.GetEntity(i);
 
-							renderQueue.add(object.mesh_index, i, 0);
+							renderQueue.add(object.mesh_index, uint32_t(i), 0);
 
 							if (object.GetRenderTypes() & RENDERTYPE_TRANSPARENT || object.GetRenderTypes() & RENDERTYPE_WATER)
 							{
@@ -4838,21 +4850,19 @@ void DrawShadowmaps(
 					device->BindDynamicConstantBuffer(cb, CBSLOT_RENDERER_CAMERA, cmd);
 
 					Viewport vp;
-					vp.top_left_x = 0;
-					vp.top_left_y = 0;
-					vp.width = (float)SHADOWRES_2D;
-					vp.height = (float)SHADOWRES_2D;
+					vp.top_left_x = float(light.shadow_rect.x);
+					vp.top_left_y = float(light.shadow_rect.y);
+					vp.width = float(light.shadow_rect.w);
+					vp.height = float(light.shadow_rect.h);
 					vp.min_depth = 0.0f;
 					vp.max_depth = 1.0f;
 					device->BindViewports(1, &vp, cmd);
 
-					device->RenderPassBegin(&renderpasses_shadow2D[slice], cmd);
 					RenderMeshes(vis, renderQueue, RENDERPASS_SHADOW, RENDERTYPE_OPAQUE, cmd);
 					if (GetTransparentShadowsEnabled() && transparentShadowsRequested)
 					{
 						RenderMeshes(vis, renderQueue, RENDERPASS_SHADOW, RENDERTYPE_TRANSPARENT | RENDERTYPE_WATER, cmd);
 					}
-					device->RenderPassEnd(cmd);
 
 					if (predicationRequest && light.occlusionquery >= 0)
 						device->PredicationEnd(cmd);
@@ -4862,11 +4872,6 @@ void DrawShadowmaps(
 			break;
 			case LightComponent::POINT:
 			{
-				if (shadowCounter_Cube >= SHADOWCOUNT_CUBE)
-					break;
-				uint32_t slice = shadowCounter_Cube;
-				shadowCounter_Cube += 1;
-
 				Sphere boundingsphere(light.position, light.GetRange());
 
 				renderQueue.init();
@@ -4881,7 +4886,7 @@ void DrawShadowmaps(
 						{
 							Entity cullable_entity = vis.scene->aabb_objects.GetEntity(i);
 
-							renderQueue.add(object.mesh_index, i, 0);
+							renderQueue.add(object.mesh_index, uint32_t(i), 0);
 
 							if (object.GetRenderTypes() & RENDERTYPE_TRANSPARENT || object.GetRenderTypes() & RENDERTYPE_WATER)
 							{
@@ -4902,14 +4907,9 @@ void DrawShadowmaps(
 
 					const float zNearP = 0.1f;
 					const float zFarP = std::max(1.0f, light.GetRange());
-					SHCAM cameras[] = {
-						SHCAM(light.position, XMFLOAT4(0.5f, -0.5f, -0.5f, -0.5f), zNearP, zFarP, XM_PIDIV2), //+x
-						SHCAM(light.position, XMFLOAT4(0.5f, 0.5f, 0.5f, -0.5f), zNearP, zFarP, XM_PIDIV2), //-x
-						SHCAM(light.position, XMFLOAT4(1, 0, 0, -0), zNearP, zFarP, XM_PIDIV2), //+y
-						SHCAM(light.position, XMFLOAT4(0, 0, 0, -1), zNearP, zFarP, XM_PIDIV2), //-y
-						SHCAM(light.position, XMFLOAT4(0.707f, 0, 0, -0.707f), zNearP, zFarP, XM_PIDIV2), //+z
-						SHCAM(light.position, XMFLOAT4(0, 0.707f, 0.707f, 0), zNearP, zFarP, XM_PIDIV2), //-z
-					};
+					SHCAM cameras[6];
+					CreateCubemapCameras(light.position, zNearP, zFarP, cameras, arraysize(cameras));
+					Viewport vp[arraysize(cameras)];
 					Frustum frusta[arraysize(cameras)];
 					uint32_t frustum_count = 0;
 
@@ -4923,25 +4923,21 @@ void DrawShadowmaps(
 							frusta[frustum_count] = cameras[shcam].frustum;
 							frustum_count++;
 						}
+						vp[shcam].top_left_x = float(light.shadow_rect.x + shcam * light.shadow_rect.w);
+						vp[shcam].top_left_y = float(light.shadow_rect.y);
+						vp[shcam].width = float(light.shadow_rect.w);
+						vp[shcam].height = float(light.shadow_rect.h);
+						vp[shcam].min_depth = 0.0f;
+						vp[shcam].max_depth = 1.0f;
 					}
 					device->BindDynamicConstantBuffer(cb, CB_GETBINDSLOT(CubemapRenderCB), cmd);
+					device->BindViewports(arraysize(vp), vp, cmd);
 
-					Viewport vp;
-					vp.top_left_x = 0;
-					vp.top_left_y = 0;
-					vp.width = (float)SHADOWRES_CUBE;
-					vp.height = (float)SHADOWRES_CUBE;
-					vp.min_depth = 0.0f;
-					vp.max_depth = 1.0f;
-					device->BindViewports(1, &vp, cmd);
-
-					device->RenderPassBegin(&renderpasses_shadowCube[slice], cmd);
 					RenderMeshes(vis, renderQueue, RENDERPASS_SHADOWCUBE, RENDERTYPE_OPAQUE, cmd, false, frusta, frustum_count);
 					if (GetTransparentShadowsEnabled() && transparentShadowsRequested)
 					{
 						RenderMeshes(vis, renderQueue, RENDERPASS_SHADOWCUBE, RENDERTYPE_TRANSPARENT | RENDERTYPE_WATER, cmd, false, frusta, frustum_count);
 					}
-					device->RenderPassEnd(cmd);
 
 					if (predicationRequest && light.occlusionquery >= 0)
 						device->PredicationEnd(cmd);
@@ -4952,7 +4948,10 @@ void DrawShadowmaps(
 			} // terminate switch
 		}
 
-		wi::profiler::EndRange(range); // Shadow Rendering
+		device->RenderPassEnd(cmd);
+
+		wi::profiler::EndRange(range_gpu);
+		wi::profiler::EndRange(range_cpu);
 		device->EventEnd(cmd);
 	}
 }
@@ -4968,6 +4967,7 @@ void DrawScene(
 	const bool transparent = flags & DRAWSCENE_TRANSPARENT;
 	const bool tessellation = (flags & DRAWSCENE_TESSELLATION) && GetTessellationEnabled();
 	const bool hairparticle = flags & DRAWSCENE_HAIRPARTICLE;
+	const bool impostor = flags & DRAWSCENE_IMPOSTOR;
 	const bool occlusion = (flags & DRAWSCENE_OCCLUSIONCULLING) && GetOcclusionCullingEnabled();
 
 	device->EventBegin("DrawScene", cmd);
@@ -4982,9 +4982,6 @@ void DrawScene(
 			vis.scene->ocean.Render(*vis.camera, vis.scene->weather.oceanParameters, cmd);
 		}
 	}
-
-	if (IsWireRender() && !transparent)
-		return;
 
 	uint32_t renderTypeFlags = 0;
 	if (opaque)
@@ -5002,38 +4999,6 @@ void DrawScene(
 		renderTypeFlags = RENDERTYPE_ALL;
 	}
 
-	static thread_local RenderQueue renderQueue;
-	renderQueue.init();
-	for (uint32_t instanceIndex : vis.visibleObjects)
-	{
-		const ObjectComponent& object = vis.scene->objects[instanceIndex];
-
-		if (occlusion && object.IsOccluded())
-			continue;
-
-		if (object.IsRenderable() && (object.GetRenderTypes() & renderTypeFlags))
-		{
-			const float distance = wi::math::Distance(vis.camera->Eye, object.center);
-			if (object.IsImpostorPlacement() && distance > object.impostorSwapDistance + object.impostorFadeThresholdRadius)
-			{
-				continue;
-			}
-			renderQueue.add(object.mesh_index, instanceIndex, distance);
-		}
-	}
-	if (!renderQueue.empty())
-	{
-		if (transparent)
-		{
-			renderQueue.sort(RenderQueue::SORT_BACK_TO_FRONT);
-		}
-		else if (renderPass == RENDERPASS_PREPASS)
-		{
-			renderQueue.sort(RenderQueue::SORT_FRONT_TO_BACK);
-		}
-		RenderMeshes(vis, renderQueue, renderPass, renderTypeFlags, cmd, tessellation);
-	}
-
 	if (hairparticle)
 	{
 		if (IsWireRender() || !transparent)
@@ -5049,7 +5014,42 @@ void DrawScene(
 		}
 	}
 
-	RenderImpostors(vis, renderPass, cmd);
+	static thread_local RenderQueue renderQueue;
+	renderQueue.init();
+	for (uint32_t instanceIndex : vis.visibleObjects)
+	{
+		const ObjectComponent& object = vis.scene->objects[instanceIndex];
+
+		if (occlusion && object.IsOccluded())
+			continue;
+
+		if (object.IsRenderable() && (object.GetRenderTypes() & renderTypeFlags))
+		{
+			const float distance = wi::math::Distance(vis.camera->Eye, object.center);
+			if (distance > object.fadeDistance + object.radius)
+			{
+				continue;
+			}
+			renderQueue.add(object.mesh_index, instanceIndex, distance);
+		}
+	}
+	if (!renderQueue.empty())
+	{
+		if (transparent)
+		{
+			renderQueue.sort_transparent();
+		}
+		else
+		{
+			renderQueue.sort_opaque();
+		}
+		RenderMeshes(vis, renderQueue, renderPass, renderTypeFlags, cmd, tessellation);
+	}
+
+	if (impostor)
+	{
+		RenderImpostors(vis, renderPass, cmd);
+	}
 
 	device->BindShadingRate(ShadingRate::RATE_1X1, cmd);
 	device->EventEnd(cmd);
@@ -5956,8 +5956,7 @@ void DrawDebugWorld(
 
 			GraphicsDevice::GPUAllocation mem = device->AllocateGPU(sizeof(ShaderMeshInstancePointer), cmd);
 			ShaderMeshInstancePointer poi;
-			poi.init();
-			poi.instanceIndex = (uint)scene.objects.GetIndex(x.objectEntity);
+			poi.Create((uint)scene.objects.GetIndex(x.objectEntity));
 			std::memcpy(mem.data, &poi, sizeof(poi));
 
 			device->BindIndexBuffer(&mesh.generalBuffer, mesh.GetIndexFormat(), mesh.ib.offset, cmd);
@@ -6088,7 +6087,71 @@ void DrawDebugWorld(
 
 	if (GetRaytraceDebugBVHVisualizerEnabled())
 	{
-		RayTraceSceneBVH(scene, cmd);
+		//PE: Check if debug BVH is possible. or it will crash.
+		if (GetSurfelGIEnabled() || GetDDGIEnabled() )
+		{
+			RayTraceSceneBVH(scene, cmd);
+		}
+	}
+
+	if (!debugTextStorage.empty())
+	{
+		device->EventBegin("DebugTexts", cmd);
+		const XMMATRIX VP = camera.GetViewProjection();
+		const XMMATRIX R = XMLoadFloat3x3(&camera.rotationMatrix);
+		struct DebugTextSorter
+		{
+			const char* text;
+			size_t text_len;
+			DebugTextParams params;
+			float distance;
+		};
+		static thread_local wi::vector<DebugTextSorter> sorted_texts;
+		sorted_texts.clear();
+		size_t offset = 0;
+		while(offset < debugTextStorage.size())
+		{
+			auto& x = sorted_texts.emplace_back();
+			x.params = *(const DebugTextParams*)(debugTextStorage.data() + offset);
+			offset += sizeof(DebugTextParams);
+			x.text = (const char*)(debugTextStorage.data() + offset);
+			x.text_len = strlen(x.text);
+			offset += x.text_len + 1;
+			x.distance = wi::math::Distance(x.params.position, camera.Eye);
+
+		}
+		std::sort(sorted_texts.begin(), sorted_texts.end(), [](const DebugTextSorter& a, const DebugTextSorter& b) {
+			return a.distance > b.distance;
+			});
+		for (auto& x : sorted_texts)
+		{
+			wi::font::Params params;
+			params.position = x.params.position;
+			params.size = x.params.pixel_height;
+			params.scaling = 1.0f / params.size * x.params.scaling;
+			params.color = wi::Color::fromFloat4(x.params.color);
+			params.h_align = wi::font::WIFALIGN_CENTER;
+			params.v_align = wi::font::WIFALIGN_CENTER;
+			params.softness = 0.1f;
+			params.shadowColor = wi::Color::Black();
+			params.shadow_softness = 0.8f;
+			params.customProjection = &VP;
+			if (x.params.flags & DebugTextParams::DEPTH_TEST)
+			{
+				params.enableDepthTest();
+			}
+			if (x.params.flags & DebugTextParams::CAMERA_FACING)
+			{
+				params.customRotation = &R;
+			}
+			if (x.params.flags & DebugTextParams::CAMERA_SCALING)
+			{
+				params.scaling *= x.distance * 0.05f;
+			}
+			wi::font::Draw(x.text, x.text_len, params, cmd);
+		}
+		debugTextStorage.clear();
+		device->EventEnd(cmd);
 	}
 
 	device->EventEnd(cmd);
@@ -6315,15 +6378,8 @@ void RefreshEnvProbes(const Visibility& vis, CommandList cmd)
 
 	auto render_probe = [&](const EnvironmentProbeComponent& probe, const AABB& probe_aabb) {
 
-
-		const SHCAM cameras[] = {
-			SHCAM(probe.position, XMFLOAT4(0.5f, -0.5f, -0.5f, -0.5f), zNearP, zFarP, XM_PIDIV2), //+x
-			SHCAM(probe.position, XMFLOAT4(0.5f, 0.5f, 0.5f, -0.5f), zNearP, zFarP, XM_PIDIV2), //-x
-			SHCAM(probe.position, XMFLOAT4(1, 0, 0, -0), zNearP, zFarP, XM_PIDIV2), //+y
-			SHCAM(probe.position, XMFLOAT4(0, 0, 0, -1), zNearP, zFarP, XM_PIDIV2), //-y
-			SHCAM(probe.position, XMFLOAT4(0.707f, 0, 0, -0.707f), zNearP, zFarP, XM_PIDIV2), //+z
-			SHCAM(probe.position, XMFLOAT4(0, 0.707f, 0.707f, 0), zNearP, zFarP, XM_PIDIV2), //-z
-		};
+		SHCAM cameras[6];
+		CreateCubemapCameras(probe.position, zNearP, zFarP, cameras, arraysize(cameras));
 		Frustum frusta[arraysize(cameras)];
 
 		CubemapRenderCB cb;
@@ -6345,7 +6401,14 @@ void RefreshEnvProbes(const Visibility& vis, CommandList cmd)
 			RefreshAtmosphericScatteringTextures(cmd);
 		}
 
-		device->RenderPassBegin(&vis.scene->renderpasses_envmap[probe.textureIndex], cmd);
+		if (probe.IsMSAA())
+		{
+			device->RenderPassBegin(&vis.scene->renderpasses_envmap_MSAA[probe.textureIndex], cmd);
+		}
+		else
+		{
+			device->RenderPassBegin(&vis.scene->renderpasses_envmap[probe.textureIndex], cmd);
+		}
 
 		// Scene will only be rendered if this is a real probe entity:
 		if (probe_aabb.layerMask & vis.layerMask)
@@ -6362,7 +6425,7 @@ void RefreshEnvProbes(const Visibility& vis, CommandList cmd)
 					const ObjectComponent& object = vis.scene->objects[i];
 					if (object.IsRenderable())
 					{
-						renderQueue.add(object.mesh_index, i, 0);
+						renderQueue.add(object.mesh_index, uint32_t(i), 0);
 					}
 				}
 			}
@@ -6498,7 +6561,16 @@ void RefreshImpostors(const Scene& scene, CommandList cmd)
 
 	device->EventBegin("Impostor Refresh", cmd);
 
+	device->BindPipelineState(&PSO_captureimpostor, cmd);
+
+	Viewport viewport;
+	viewport.width = viewport.height = (float)scene.impostorTextureDim;
+	device->BindViewports(1, &viewport, cmd);
+
 	BindCommonResources(cmd);
+
+	barrier_stack.push_back(GPUBarrier::Image(&scene.impostorArray, ResourceState::SHADER_RESOURCE, ResourceState::RENDERTARGET));
+	barrier_stack_flush(cmd);
 
 	for (uint32_t impostorIndex = 0; impostorIndex < scene.impostors.GetCount(); ++impostorIndex)
 	{
@@ -6515,77 +6587,58 @@ void RefreshImpostors(const Scene& scene, CommandList cmd)
 
 		device->BindIndexBuffer(&mesh.generalBuffer, mesh.GetIndexFormat(), mesh.ib.offset, cmd);
 
-		for (int prop = 0; prop < 3; ++prop)
+		for (size_t i = 0; i < impostorCaptureAngles; ++i)
 		{
-			switch (prop)
+			CameraComponent impostorcamera;
+			impostorcamera.SetCustomProjectionEnabled(true);
+			TransformComponent camera_transform;
+
+			camera_transform.ClearTransform();
+			camera_transform.Translate(boundingsphere.center);
+
+			XMMATRIX P = XMMatrixOrthographicOffCenterLH(-boundingsphere.radius, boundingsphere.radius, -boundingsphere.radius, boundingsphere.radius, -boundingsphere.radius, boundingsphere.radius);
+			XMStoreFloat4x4(&impostorcamera.Projection, P);
+			XMVECTOR Q = XMQuaternionNormalize(XMQuaternionRotationAxis(XMVectorSet(0, 1, 0, 0), XM_2PI * (float)i / (float)impostorCaptureAngles));
+			XMStoreFloat4(&camera_transform.rotation_local, Q);
+
+			camera_transform.UpdateTransform();
+			impostorcamera.TransformCamera(camera_transform);
+			impostorcamera.UpdateCamera();
+
+			BindCameraCB(impostorcamera, impostorcamera, impostorcamera, cmd);
+
+			int slice = (int)(impostor.textureIndex * impostorCaptureAngles + i);
+			device->RenderPassBegin(&scene.renderpasses_impostor[slice], cmd);
+
+			uint32_t first_subset = 0;
+			uint32_t last_subset = 0;
+			mesh.GetLODSubsetRange(0, first_subset, last_subset);
+			for (uint32_t subsetIndex = first_subset; subsetIndex < last_subset; ++subsetIndex)
 			{
-			case 0:
-				device->BindPipelineState(&PSO_captureimpostor_albedo, cmd);
-				break;
-			case 1:
-				device->BindPipelineState(&PSO_captureimpostor_normal, cmd);
-				break;
-			case 2:
-				device->BindPipelineState(&PSO_captureimpostor_surface, cmd);
-				break;
-			}
-
-			for (size_t i = 0; i < impostorCaptureAngles; ++i)
-			{
-				CameraComponent impostorcamera;
-				impostorcamera.SetCustomProjectionEnabled(true);
-				TransformComponent camera_transform;
-
-				camera_transform.ClearTransform();
-				camera_transform.Translate(boundingsphere.center);
-
-				XMMATRIX P = XMMatrixOrthographicOffCenterLH(-boundingsphere.radius, boundingsphere.radius, -boundingsphere.radius, boundingsphere.radius, -boundingsphere.radius, boundingsphere.radius);
-				XMStoreFloat4x4(&impostorcamera.Projection, P);
-				XMVECTOR Q = XMQuaternionNormalize(XMQuaternionRotationAxis(XMVectorSet(0, 1, 0, 0), XM_2PI * (float)i / (float)impostorCaptureAngles));
-				XMStoreFloat4(&camera_transform.rotation_local, Q);
-
-				camera_transform.UpdateTransform();
-				impostorcamera.TransformCamera(camera_transform);
-				impostorcamera.UpdateCamera();
-
-				BindCameraCB(impostorcamera, impostorcamera, impostorcamera, cmd);
-
-
-				int textureIndex = (int)(impostorIndex * impostorCaptureAngles * 3 + prop * impostorCaptureAngles + i);
-				device->RenderPassBegin(&scene.renderpasses_impostor[textureIndex], cmd);
-
-				Viewport viewport;
-				viewport.height = (float)scene.impostorTextureDim;
-				viewport.width = (float)scene.impostorTextureDim;
-				device->BindViewports(1, &viewport, cmd);
-
-				uint32_t first_subset = 0;
-				uint32_t last_subset = 0;
-				mesh.GetLODSubsetRange(0, first_subset, last_subset);
-				for (uint32_t subsetIndex = first_subset; subsetIndex < last_subset; ++subsetIndex)
+				const MeshComponent::MeshSubset& subset = mesh.subsets[subsetIndex];
+				if (subset.indexCount == 0)
 				{
-					const MeshComponent::MeshSubset& subset = mesh.subsets[subsetIndex];
-					if (subset.indexCount == 0)
-					{
-						continue;
-					}
-					const MaterialComponent& material = *scene.materials.GetComponent(subset.materialID);
-
-					ObjectPushConstants push;
-					push.geometryIndex = mesh.geometryOffset + subsetIndex;
-					push.materialIndex = subset.materialIndex;
-					push.instances = -1;
-					push.instance_offset = 0;
-					device->PushConstants(&push, sizeof(push), cmd);
-
-					device->DrawIndexedInstanced(subset.indexCount, 1, subset.indexOffset, 0, 0, cmd);
+					continue;
 				}
+				const MaterialComponent& material = *scene.materials.GetComponent(subset.materialID);
 
-				device->RenderPassEnd(cmd);
+				ObjectPushConstants push;
+				push.geometryIndex = mesh.geometryOffset + subsetIndex;
+				push.materialIndex = subset.materialIndex;
+				push.instances = -1;
+				push.instance_offset = 0;
+				device->PushConstants(&push, sizeof(push), cmd);
+
+				device->DrawIndexedInstanced(subset.indexCount, 1, subset.indexOffset, 0, 0, cmd);
 			}
+
+			device->RenderPassEnd(cmd);
 		}
 
 	}
+
+	barrier_stack.push_back(GPUBarrier::Image(&scene.impostorArray, ResourceState::RENDERTARGET, ResourceState::SHADER_RESOURCE));
+	barrier_stack_flush(cmd);
 
 	device->EventEnd(cmd);
 }
@@ -6627,7 +6680,7 @@ void VoxelRadiance(const Visibility& vis, CommandList cmd)
 			const ObjectComponent& object = vis.scene->objects[i];
 			if (object.IsRenderable())
 			{
-				renderQueue.add(object.mesh_index, i, 0);
+				renderQueue.add(object.mesh_index, uint32_t(i), 0);
 			}
 		}
 	}
@@ -6882,6 +6935,12 @@ void DownsampleDepthBuffer(const Texture& src, CommandList cmd)
 
 void GenerateMipChain(const Texture& texture, MIPGENFILTER filter, CommandList cmd, const MIPGEN_OPTIONS& options)
 {
+	if (!texture.IsValid())
+	{
+		assert(0);
+		return;
+	}
+
 	TextureDesc desc = texture.GetDesc();
 
 	if (desc.mip_levels < 2)
@@ -7636,7 +7695,7 @@ void ComputeBloom(
 		bloom.exposure = exposure;
 		bloom.texture_input = device->GetDescriptorIndex(&input, SubresourceType::SRV);
 		bloom.texture_output = device->GetDescriptorIndex(&res.texture_bloom, SubresourceType::UAV);
-		bloom.buffer_input_luminance = device->GetDescriptorIndex(buffer_luminance, SubresourceType::SRV);
+		bloom.buffer_input_luminance = device->GetDescriptorIndex((buffer_luminance == nullptr) ? &luminance_dummy : buffer_luminance, SubresourceType::SRV);
 		device->PushConstants(&bloom, sizeof(bloom), cmd);
 
 		{
@@ -7822,7 +7881,7 @@ void Visibility_Prepare(
 			device->BindUAV(res.depthbuffer, 5, cmd, 2);
 			device->BindUAV(res.depthbuffer, 6, cmd, 3);
 			device->BindUAV(res.depthbuffer, 7, cmd, 4);
-			barrier_stack.push_back(GPUBarrier::Image(res.depthbuffer, res.depthbuffer->desc.layout, ResourceState::UNORDERED_ACCESS));
+			barrier_stack.push_back(GPUBarrier::Image(res.depthbuffer, ResourceState::UNDEFINED, ResourceState::UNORDERED_ACCESS));
 		}
 		else
 		{
@@ -7839,7 +7898,7 @@ void Visibility_Prepare(
 			device->BindUAV(res.lineardepth, 10, cmd, 2);
 			device->BindUAV(res.lineardepth, 11, cmd, 3);
 			device->BindUAV(res.lineardepth, 12, cmd, 4);
-			barrier_stack.push_back(GPUBarrier::Image(res.lineardepth, res.lineardepth->desc.layout, ResourceState::UNORDERED_ACCESS));
+			barrier_stack.push_back(GPUBarrier::Image(res.lineardepth, ResourceState::UNDEFINED, ResourceState::UNORDERED_ACCESS));
 		}
 		else
 		{
@@ -7852,7 +7911,7 @@ void Visibility_Prepare(
 		if (res.primitiveID_resolved)
 		{
 			device->BindUAV(res.primitiveID_resolved, 13, cmd);
-			barrier_stack.push_back(GPUBarrier::Image(res.primitiveID_resolved, res.primitiveID_resolved->desc.layout, ResourceState::UNORDERED_ACCESS));
+			barrier_stack.push_back(GPUBarrier::Image(res.primitiveID_resolved, ResourceState::UNDEFINED, ResourceState::UNORDERED_ACCESS));
 		}
 		else
 		{
@@ -12325,6 +12384,12 @@ void Postprocess_Tonemap(
 	ColorSpace display_colorspace
 )
 {
+	if (!input.IsValid() || !output.IsValid())
+	{
+		assert(0);
+		return;
+	}
+
 	device->EventBegin("Postprocess_Tonemap", cmd);
 
 	device->BindComputeShader(&shaders[CSTYPE_POSTPROCESS_TONEMAP], cmd);
@@ -12339,7 +12404,7 @@ void Postprocess_Tonemap(
 	tonemap_push.exposure = exposure;
 	tonemap_push.dither = dither ? 1.0f : 0.0f;
 	tonemap_push.texture_input = device->GetDescriptorIndex(&input, SubresourceType::SRV);
-	tonemap_push.buffer_input_luminance = device->GetDescriptorIndex(buffer_luminance, SubresourceType::SRV);
+	tonemap_push.buffer_input_luminance = device->GetDescriptorIndex((buffer_luminance == nullptr) ? &luminance_dummy : buffer_luminance, SubresourceType::SRV);
 	tonemap_push.texture_input_distortion = device->GetDescriptorIndex(texture_distortion, SubresourceType::SRV);
 	tonemap_push.texture_colorgrade_lookuptable = device->GetDescriptorIndex(texture_colorgradinglut, SubresourceType::SRV);
 	tonemap_push.texture_bloom = device->GetDescriptorIndex(texture_bloom, SubresourceType::SRV);
@@ -12844,6 +12909,18 @@ void DrawTriangle(const RenderableTriangle& triangle, bool wireframe)
 		renderableTriangles_solid.push_back(triangle);
 	}
 }
+void DrawDebugText(const char* text, const DebugTextParams& params)
+{
+	for (size_t i = 0; i < sizeof(DebugTextParams); ++i)
+	{
+		debugTextStorage.push_back(((uint8_t*)(&params))[i]);
+	}
+	size_t len = strlen(text) + 1;
+	for (size_t i = 0; i < len; ++i)
+	{
+		debugTextStorage.push_back(uint8_t(text[i]));
+	}
+}
 void DrawPaintRadius(const PaintRadius& paintrad)
 {
 	paintrads.push_back(paintrad);
@@ -12858,8 +12935,6 @@ void AddDeferredMIPGen(const Texture& texture, bool preserve_coverage)
 
 
 
-int GetShadowRes2D() { return SHADOWRES_2D; }
-int GetShadowResCube() { return SHADOWRES_CUBE; }
 void SetTransparentShadowsEnabled(float value) { TRANSPARENTSHADOWSENABLED = value; }
 float GetTransparentShadowsEnabled() { return TRANSPARENTSHADOWSENABLED; }
 void SetWireRender(bool value) { wireRender = value; }

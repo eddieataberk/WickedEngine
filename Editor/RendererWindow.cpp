@@ -3,8 +3,9 @@
 #include "Editor.h"
 #include "shaders/ShaderInterop_DDGI.h"
 
-void RendererWindow::Create(EditorComponent* editor)
+void RendererWindow::Create(EditorComponent* _editor)
 {
+	editor = _editor;
 	wi::gui::Window::Create("Renderer Window");
 
 	wi::renderer::SetToDrawDebugEnvProbes(true);
@@ -67,7 +68,7 @@ void RendererWindow::Create(EditorComponent* editor)
 	resolutionScaleSlider.SetSize(XMFLOAT2(100, itemheight));
 	resolutionScaleSlider.SetPos(XMFLOAT2(x, y += step));
 	resolutionScaleSlider.SetValue(editor->resolutionScale);
-	resolutionScaleSlider.OnSlide([editor](wi::gui::EventArgs args) {
+	resolutionScaleSlider.OnSlide([=](wi::gui::EventArgs args) {
 		if (editor->resolutionScale != args.fValue)
 		{
 			editor->renderPath->resolutionScale = args.fValue;
@@ -82,7 +83,7 @@ void RendererWindow::Create(EditorComponent* editor)
 	GIBoostSlider.SetSize(XMFLOAT2(100, itemheight));
 	GIBoostSlider.SetPos(XMFLOAT2(x, y += step));
 	GIBoostSlider.SetValue(wi::renderer::GetGIBoost());
-	GIBoostSlider.OnSlide([editor](wi::gui::EventArgs args) {
+	GIBoostSlider.OnSlide([=](wi::gui::EventArgs args) {
 		wi::renderer::SetGIBoost(args.fValue);
 		});
 	AddWidget(&GIBoostSlider);
@@ -237,7 +238,7 @@ void RendererWindow::Create(EditorComponent* editor)
 	variableRateShadingClassificationCheckBox.SetTooltip("Enable classification of variable rate shading on the screen. Less important parts will be shaded with lesser resolution.\nRequires Tier2 support for variable shading rate");
 	variableRateShadingClassificationCheckBox.SetPos(XMFLOAT2(x, y += step));
 	variableRateShadingClassificationCheckBox.SetSize(XMFLOAT2(itemheight, itemheight));
-	variableRateShadingClassificationCheckBox.OnClick([editor](wi::gui::EventArgs args) {
+	variableRateShadingClassificationCheckBox.OnClick([=](wi::gui::EventArgs args) {
 		wi::renderer::SetVariableRateShadingClassification(args.bValue);
 		editor->ResizeBuffers();
 		});
@@ -347,32 +348,32 @@ void RendererWindow::Create(EditorComponent* editor)
 		switch (args.iValue)
 		{
 		case 0:
-			wi::renderer::SetShadowProps2D(0, -1);
+			wi::renderer::SetShadowProps2D(0);
 			break;
 		case 1:
-			wi::renderer::SetShadowProps2D(128, -1);
+			wi::renderer::SetShadowProps2D(128);
 			break;
 		case 2:
-			wi::renderer::SetShadowProps2D(256, -1);
+			wi::renderer::SetShadowProps2D(256);
 			break;
 		case 3:
-			wi::renderer::SetShadowProps2D(512, -1);
+			wi::renderer::SetShadowProps2D(512);
 			break;
 		case 4:
-			wi::renderer::SetShadowProps2D(1024, -1);
+			wi::renderer::SetShadowProps2D(1024);
 			break;
 		case 5:
-			wi::renderer::SetShadowProps2D(2048, -1);
+			wi::renderer::SetShadowProps2D(2048);
 			break;
 		case 6:
-			wi::renderer::SetShadowProps2D(4096, -1);
+			wi::renderer::SetShadowProps2D(4096);
 			break;
 		default:
 			break;
 		}
 	});
 	shadowProps2DComboBox.SetSelected(4);
-	shadowProps2DComboBox.SetTooltip("Choose a shadow quality preset for 2D shadow maps (spotlights, directional lights)...");
+	shadowProps2DComboBox.SetTooltip("Choose a shadow quality preset for 2D shadow maps (spotlights, directional lights)...\nThis specifies the maximum shadow resolution for these light types, but that can dynamically change unless they are set to a fixed resolution individually.");
 	shadowProps2DComboBox.SetScriptTip("SetShadowProps2D(int resolution, int count, int softShadowQuality)");
 	AddWidget(&shadowProps2DComboBox);
 
@@ -385,37 +386,33 @@ void RendererWindow::Create(EditorComponent* editor)
 	shadowPropsCubeComboBox.AddItem("512");
 	shadowPropsCubeComboBox.AddItem("1024");
 	shadowPropsCubeComboBox.AddItem("2048");
-	shadowPropsCubeComboBox.AddItem("4096");
 	shadowPropsCubeComboBox.OnSelect([&](wi::gui::EventArgs args) {
 		switch (args.iValue)
 		{
 		case 0:
-			wi::renderer::SetShadowPropsCube(0, -1);
+			wi::renderer::SetShadowPropsCube(0);
 			break;
 		case 1:
-			wi::renderer::SetShadowPropsCube(128, -1);
+			wi::renderer::SetShadowPropsCube(128);
 			break;
 		case 2:
-			wi::renderer::SetShadowPropsCube(256, -1);
+			wi::renderer::SetShadowPropsCube(256);
 			break;
 		case 3:
-			wi::renderer::SetShadowPropsCube(512, -1);
+			wi::renderer::SetShadowPropsCube(512);
 			break;
 		case 4:
-			wi::renderer::SetShadowPropsCube(1024, -1);
+			wi::renderer::SetShadowPropsCube(1024);
 			break;
 		case 5:
-			wi::renderer::SetShadowPropsCube(2048, -1);
-			break;
-		case 6:
-			wi::renderer::SetShadowPropsCube(4096, -1);
+			wi::renderer::SetShadowPropsCube(2048);
 			break;
 		default:
 			break;
 		}
 	});
 	shadowPropsCubeComboBox.SetSelected(2);
-	shadowPropsCubeComboBox.SetTooltip("Choose a shadow quality preset for cube shadow maps (pointlights, area lights)...");
+	shadowPropsCubeComboBox.SetTooltip("Choose a shadow quality preset for cube shadow maps (pointlights, area lights)...\nThis specifies the maximum shadow resolution for these light types, but that can dynamically change unless they are set to a fixed resolution individually.");
 	shadowPropsCubeComboBox.SetScriptTip("SetShadowPropsCube(int resolution, int count)");
 	AddWidget(&shadowPropsCubeComboBox);
 
@@ -532,9 +529,15 @@ void RendererWindow::Create(EditorComponent* editor)
 	// Visualizer toggles:
 	x = 540, y = 0;
 
+	nameDebugCheckBox.Create("Name visualizer: ");
+	nameDebugCheckBox.SetTooltip("Visualize the entity names in the scene");
+	nameDebugCheckBox.SetPos(XMFLOAT2(x, y));
+	nameDebugCheckBox.SetSize(XMFLOAT2(itemheight, itemheight));
+	AddWidget(&nameDebugCheckBox);
+
 	physicsDebugCheckBox.Create("Physics visualizer: ");
 	physicsDebugCheckBox.SetTooltip("Visualize the physics world");
-	physicsDebugCheckBox.SetPos(XMFLOAT2(x, y));
+	physicsDebugCheckBox.SetPos(XMFLOAT2(x, y += step));
 	physicsDebugCheckBox.SetSize(XMFLOAT2(itemheight, itemheight));
 	physicsDebugCheckBox.OnClick([](wi::gui::EventArgs args) {
 		wi::physics::SetDebugDrawEnabled(args.bValue);
@@ -542,16 +545,16 @@ void RendererWindow::Create(EditorComponent* editor)
 	physicsDebugCheckBox.SetCheck(wi::physics::IsDebugDrawEnabled());
 	AddWidget(&physicsDebugCheckBox);
 
-	partitionBoxesCheckBox.Create("SPTree visualizer: ");
-	partitionBoxesCheckBox.SetTooltip("Visualize the scene bounding boxes");
-	partitionBoxesCheckBox.SetScriptTip("SetDebugPartitionTreeEnabled(bool enabled)");
-	partitionBoxesCheckBox.SetPos(XMFLOAT2(x, y += step));
-	partitionBoxesCheckBox.SetSize(XMFLOAT2(itemheight, itemheight));
-	partitionBoxesCheckBox.OnClick([](wi::gui::EventArgs args) {
+	aabbDebugCheckBox.Create("AABB visualizer: ");
+	aabbDebugCheckBox.SetTooltip("Visualize the scene bounding boxes");
+	aabbDebugCheckBox.SetScriptTip("SetDebugPartitionTreeEnabled(bool enabled)");
+	aabbDebugCheckBox.SetPos(XMFLOAT2(x, y += step));
+	aabbDebugCheckBox.SetSize(XMFLOAT2(itemheight, itemheight));
+	aabbDebugCheckBox.OnClick([](wi::gui::EventArgs args) {
 		wi::renderer::SetToDrawDebugPartitionTree(args.bValue);
 	});
-	partitionBoxesCheckBox.SetCheck(wi::renderer::GetToDrawDebugPartitionTree());
-	AddWidget(&partitionBoxesCheckBox);
+	aabbDebugCheckBox.SetCheck(wi::renderer::GetToDrawDebugPartitionTree());
+	AddWidget(&aabbDebugCheckBox);
 
 	boneLinesCheckBox.Create("Bone line visualizer: ");
 	boneLinesCheckBox.SetTooltip("Visualize bones of armatures");

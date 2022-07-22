@@ -12,7 +12,7 @@ struct ShaderScene
 
 	int envmaparray;
 	int globalenvmap;
-	int padding0;
+	int impostorInstanceOffset;
 	int padding1;
 
 	int TLAS;
@@ -125,6 +125,70 @@ struct ShaderMaterial
 	int			texture_specularmap_index;
 	uint		shaderType;
 
+	void init()
+	{
+		baseColor = float4(1, 1, 1, 1);
+		subsurfaceScattering = float4(0, 0, 0, 0);
+		subsurfaceScattering_inv = float4(0, 0, 0, 0);
+		texMulAdd = float4(1, 1, 0, 0);
+
+		roughness = 0;
+		reflectance = 0;
+		metalness = 0;
+		refraction = 0;
+
+		normalMapStrength = 0;
+		parallaxOcclusionMapping = 0;
+		alphaTest = 0;
+		displacementMapping = 0;
+
+		transmission = 0;
+		options = 0u;
+		emissive_r11g11b10 = 0;
+		specular_r11g11b10 = 0;
+
+		layerMask = ~0u;
+		uvset_baseColorMap = -1;
+		uvset_surfaceMap = -1;
+		uvset_normalMap = -1;
+
+		uvset_displacementMap = -1;
+		uvset_emissiveMap = -1;
+		uvset_occlusionMap = -1;
+		uvset_transmissionMap = -1;
+
+		uvset_sheenColorMap = -1;
+		uvset_sheenRoughnessMap = -1;
+		uvset_clearcoatMap = -1;
+		uvset_clearcoatRoughnessMap = -1;
+
+		uvset_clearcoatNormalMap = -1;
+		uvset_specularMap = -1;
+		sheenColor_r11g11b10 = 0;
+		sheenRoughness = 0;
+
+		clearcoat = 0;
+		clearcoatRoughness = 0;
+		texture_basecolormap_index = -1;
+		texture_surfacemap_index = -1;
+
+		texture_emissivemap_index = -1;
+		texture_normalmap_index = -1;
+		texture_displacementmap_index = -1;
+		texture_occlusionmap_index = -1;
+
+		texture_transmissionmap_index = -1;
+		texture_sheencolormap_index = -1;
+		texture_sheenroughnessmap_index = -1;
+		texture_clearcoatmap_index = -1;
+
+		texture_clearcoatroughnessmap_index = -1;
+		texture_clearcoatnormalmap_index = -1;
+		texture_specularmap_index = -1;
+		shaderType = 0;
+
+	}
+
 #ifndef __cplusplus
 	float3 GetEmissive() { return Unpack_R11G11B10_FLOAT(emissive_r11g11b10); }
 	float3 GetSpecular() { return Unpack_R11G11B10_FLOAT(specular_r11g11b10); }
@@ -196,7 +260,7 @@ struct ShaderGeometry
 	uint materialIndex;
 	uint meshletOffset; // offset of this subset in meshlets
 	uint meshletCount;
-	uint padding;
+	int impostorSliceOffset;
 
 	float3 aabb_min;
 	uint flags;
@@ -218,6 +282,7 @@ struct ShaderGeometry
 		materialIndex = 0;
 		meshletOffset = 0;
 		meshletCount = 0;
+		impostorSliceOffset = -1;
 
 		aabb_min = float3(0, 0, 0);
 		flags = 0;
@@ -284,9 +349,12 @@ struct ShaderMeshInstance
 	int lightmap;
 
 	uint meshletOffset; // offset in the global meshlet buffer for first subset
+	float fadeDistance;
 	int padding0;
 	int padding1;
-	int padding2;
+
+	float3 center;
+	float radius;
 
 	ShaderTransform transform;
 	ShaderTransform transformInverseTranspose; // This correctly handles non uniform scaling for normals
@@ -303,6 +371,9 @@ struct ShaderMeshInstance
 		geometryOffset = 0;
 		geometryCount = 0;
 		meshletOffset = ~0u;
+		fadeDistance = 0;
+		center = float3(0, 0, 0);
+		radius = 0;
 		transform.init();
 		transformInverseTranspose.init();
 		transformPrev.init();
@@ -311,28 +382,30 @@ struct ShaderMeshInstance
 };
 struct ShaderMeshInstancePointer
 {
-	uint instanceIndex;
-	uint userdata;
+	uint data;
 
 	void init()
 	{
-		instanceIndex = ~0;
-		userdata = 0;
+		data = ~0;
 	}
-	void Create(uint _instanceIndex, uint frustum_index, float dither)
+	void Create(uint _instanceIndex, uint frustum_index = 0, float dither = 0)
 	{
-		instanceIndex = _instanceIndex;
-		userdata = 0;
-		userdata |= frustum_index & 0xF;
-		userdata |= (uint(dither * 255.0f) & 0xFF) << 4u;
+		data = 0;
+		data |= _instanceIndex & 0xFFFFFF;
+		data |= (frustum_index & 0xF) << 24u;
+		data |= (uint(dither * 15.0f) & 0xF) << 28u;
+	}
+	uint GetInstanceIndex()
+	{
+		return data & 0xFFFFFF;
 	}
 	uint GetFrustumIndex()
 	{
-		return userdata & 0xF;
+		return (data >> 24u) & 0xF;
 	}
 	float GetDither()
 	{
-		return ((userdata >> 4u) & 0xFF) / 255.0f;
+		return float((data >> 28u) & 0xF) / 15.0f;
 	}
 };
 
@@ -344,23 +417,24 @@ struct ObjectPushConstants
 	uint instance_offset;
 };
 
+
 // Warning: the size of this structure directly affects shader performance.
 //	Try to reduce it as much as possible!
 //	Keep it aligned to 16 bytes for best performance!
-//	Right now, this is 48 bytes total
 struct ShaderEntity
 {
 	float3 position;
 	uint type8_flags8_range16;
 
 	uint2 direction16_coneAngleCos16;
-	uint energy16_X16; // 16 bits free
-	uint color;
+	uint2 color; // half4 packed
 
 	uint layerMask;
 	uint indices;
-	uint cubeRemap;
+	uint remap;
 	uint userdata;
+
+	float4 shadowAtlasMulAdd;
 
 #ifndef __cplusplus
 	// Shader-side:
@@ -370,46 +444,48 @@ struct ShaderEntity
 	}
 	inline uint GetFlags()
 	{
-		return (type8_flags8_range16 >> 8) & 0xFF;
+		return (type8_flags8_range16 >> 8u) & 0xFF;
 	}
 	inline float GetRange()
 	{
-		return f16tof32((type8_flags8_range16 >> 16) & 0xFFFF);
+		return f16tof32(type8_flags8_range16 >> 16u);
 	}
 	inline float3 GetDirection()
 	{
-		return float3(
-			f16tof32(direction16_coneAngleCos16.x & 0xFFFF),
-			f16tof32((direction16_coneAngleCos16.x >> 16) & 0xFFFF),
-			f16tof32(direction16_coneAngleCos16.y & 0xFFFF)
-		);
+		return normalize(float3(
+			f16tof32(direction16_coneAngleCos16.x),
+			f16tof32(direction16_coneAngleCos16.x >> 16u),
+			f16tof32(direction16_coneAngleCos16.y)
+		));
 	}
 	inline float GetConeAngleCos()
 	{
-		return f16tof32((direction16_coneAngleCos16.y >> 16) & 0xFFFF);
+		return f16tof32(direction16_coneAngleCos16.y >> 16u);
 	}
-	inline float GetEnergy()
+	inline float GetAngleScale()
 	{
-		return f16tof32(energy16_X16 & 0xFFFF);
+		return f16tof32(remap);
+	}
+	inline float GetAngleOffset()
+	{
+		return f16tof32(remap >> 16u);
 	}
 	inline float GetCubemapDepthRemapNear()
 	{
-		return f16tof32(cubeRemap & 0xFFFF);
+		return f16tof32(remap);
 	}
 	inline float GetCubemapDepthRemapFar()
 	{
-		return f16tof32((cubeRemap >> 16) & 0xFFFF);
+		return f16tof32(remap >> 16u);
 	}
 	inline float4 GetColor()
 	{
-		float4 fColor;
-
-		fColor.x = (float)((color >> 0) & 0xFF) / 255.0f;
-		fColor.y = (float)((color >> 8) & 0xFF) / 255.0f;
-		fColor.z = (float)((color >> 16) & 0xFF) / 255.0f;
-		fColor.w = (float)((color >> 24) & 0xFF) / 255.0f;
-
-		return fColor;
+		float4 retVal;
+		retVal.x = f16tof32(color.x);
+		retVal.y = f16tof32(color.x >> 16u);
+		retVal.z = f16tof32(color.y);
+		retVal.w = f16tof32(color.y >> 16u);
+		return retVal;
 	}
 	inline uint GetMatrixIndex()
 	{
@@ -417,15 +493,16 @@ struct ShaderEntity
 	}
 	inline uint GetTextureIndex()
 	{
-		return (indices >> 16) & 0xFFFF;
+		return indices >> 16u;
 	}
 	inline bool IsCastingShadow()
 	{
 		return indices != ~0;
 	}
-
-	// Load decal props:
-	inline float GetEmissive() { return GetEnergy(); }
+	inline float GetGravity()
+	{
+		return GetConeAngleCos();
+	}
 
 #else
 	// Application-side:
@@ -435,38 +512,53 @@ struct ShaderEntity
 	}
 	inline void SetFlags(uint flags)
 	{
-		type8_flags8_range16 |= (flags & 0xFF) << 8;
+		type8_flags8_range16 |= (flags & 0xFF) << 8u;
 	}
 	inline void SetRange(float value)
 	{
-		type8_flags8_range16 |= XMConvertFloatToHalf(value) << 16;
+		type8_flags8_range16 |= XMConvertFloatToHalf(value) << 16u;
+	}
+	inline void SetColor(float4 value)
+	{
+		color.x |= XMConvertFloatToHalf(value.x);
+		color.x |= XMConvertFloatToHalf(value.y) << 16u;
+		color.y |= XMConvertFloatToHalf(value.z);
+		color.y |= XMConvertFloatToHalf(value.w) << 16u;
 	}
 	inline void SetDirection(float3 value)
 	{
 		direction16_coneAngleCos16.x |= XMConvertFloatToHalf(value.x);
-		direction16_coneAngleCos16.x |= XMConvertFloatToHalf(value.y) << 16;
+		direction16_coneAngleCos16.x |= XMConvertFloatToHalf(value.y) << 16u;
 		direction16_coneAngleCos16.y |= XMConvertFloatToHalf(value.z);
 	}
 	inline void SetConeAngleCos(float value)
 	{
-		direction16_coneAngleCos16.y |= XMConvertFloatToHalf(value) << 16;
+		direction16_coneAngleCos16.y |= XMConvertFloatToHalf(value) << 16u;
 	}
-	inline void SetEnergy(float value)
+	inline void SetAngleScale(float value)
 	{
-		energy16_X16 |= XMConvertFloatToHalf(value);
+		remap |= XMConvertFloatToHalf(value);
+	}
+	inline void SetAngleOffset(float value)
+	{
+		remap |= XMConvertFloatToHalf(value) << 16u;
 	}
 	inline void SetCubeRemapNear(float value)
 	{
-		cubeRemap |= XMConvertFloatToHalf(value);
+		remap |= XMConvertFloatToHalf(value);
 	}
 	inline void SetCubeRemapFar(float value)
 	{
-		cubeRemap |= XMConvertFloatToHalf(value) << 16;
+		remap |= XMConvertFloatToHalf(value) << 16u;
 	}
 	inline void SetIndices(uint matrixIndex, uint textureIndex)
 	{
 		indices = matrixIndex & 0xFFFF;
-		indices |= (textureIndex & 0xFFFF) << 16;
+		indices |= (textureIndex & 0xFFFF) << 16u;
+	}
+	inline void SetGravity(float value)
+	{
+		SetConeAngleCos(value);
 	}
 
 #endif // __cplusplus
@@ -548,14 +640,17 @@ static const uint OPTION_BIT_STATIC_SKY_HDR = 1 << 13;
 struct FrameCB
 {
 	uint		options;							// wi::renderer bool options packed into bitmask
-	uint		shadow_cascade_count;
-	float		shadow_kernel_2D;
-	float		shadow_kernel_cube;
-
 	float		time;
 	float		time_previous;
 	float		delta_time;
+
 	uint		frame_count;
+	uint		shadow_cascade_count;
+	int			texture_shadowatlas_index;
+	int			texture_shadowatlas_transparent_index;
+
+	uint2		shadow_atlas_resolution;
+	float2		shadow_atlas_resolution_rcp;
 
 	float3		voxelradiance_center;			// center of the voxel grid in world space units
 	float		voxelradiance_max_distance;		// maximum raymarch distance for voxel GI in world-space
@@ -594,11 +689,6 @@ struct FrameCB
 	int			texture_transmittancelut_index;
 	int			texture_multiscatteringlut_index;
 	int			texture_skyluminancelut_index;
-
-	int			texture_shadowarray_2d_index;
-	int			texture_shadowarray_cube_index;
-	int			texture_shadowarray_transparent_2d_index;
-	int			texture_shadowarray_transparent_cube_index;
 
 	int			texture_voxelgi_index;
 	int			buffer_entityarray_index;
@@ -706,9 +796,9 @@ CBUFFER(ForwardEntityMaskCB, CBSLOT_RENDERER_FORWARD_LIGHTMASK)
 
 CBUFFER(VolumeLightCB, CBSLOT_RENDERER_VOLUMELIGHT)
 {
-	float4x4 lightWorld;
-	float4 lightColor;
-	float4 lightEnerdis;
+	float4x4 xLightWorld;
+	float4 xLightColor;
+	float4 xLightEnerdis;
 };
 
 struct LensFlarePush

@@ -109,7 +109,7 @@ local function Character(face, skin_color, shirt_color, hair_color, shoe_color)
 				local light_component = scene.Component_CreateLight(entity)
 				light_component.SetType(POINT)
 				light_component.SetRange(8)
-				light_component.SetEnergy(4)
+				light_component.SetIntensity(20)
 				if(self:require_hitconfirm_guard()) then
 					light_component.SetColor(Vector(0,0.5,1)) -- guarded attack emits blueish light
 				else
@@ -1946,10 +1946,10 @@ runProcess(function()
 	help_text = help_text .. "\n\t Revolver action: A, B, C, D (Hit action buttons in quick succession)"
 	help_text = help_text .. "\n\t Airborne heat: 2B, 8, 8C (Uppercut, then jump cancel into Air Kick)"
 	local font = SpriteFont(help_text);
-	font.SetSize(14)
+	font.SetSize(16)
 	font.SetPos(Vector(10, GetScreenHeight() - 10))
 	font.SetAlign(WIFALIGN_LEFT, WIFALIGN_BOTTOM)
-	font.SetColor(0xFF4D21FF)
+	font.SetColor(0xFFADA3FF)
 	font.SetShadowColor(Vector(0,0,0,1))
 	path.AddFont(font)
 

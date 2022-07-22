@@ -5,6 +5,15 @@
 
 namespace wi::lua::scene
 {
+	// If the application doesn't use the global scene, but manages it manually,
+	//	Then this can be used to override the global GetScene() in lua scripts with a custom scene
+	void SetGlobalScene(wi::scene::Scene* scene);
+	// If the application doesn't use the global camera, but manages it manually,
+	//	Then this can be used to override the global GetCamera() in lua scripts with a custom camera
+	void SetGlobalCamera(wi::scene::CameraComponent* camera);
+	wi::scene::Scene* GetGlobalScene();
+	wi::scene::CameraComponent* GetGlobalCamera();
+
 	void Bind();
 
 	class Scene_BindLua
@@ -79,6 +88,8 @@ namespace wi::lua::scene
 		int Component_Attach(lua_State* L);
 		int Component_Detach(lua_State* L);
 		int Component_DetachChildren(lua_State* L);
+
+		int GetBounds(lua_State* L);
 	};
 
 	class NameComponent_BindLua
@@ -275,9 +286,15 @@ namespace wi::lua::scene
 
 		int SetType(lua_State* L);
 		int SetRange(lua_State* L);
-		int SetEnergy(lua_State* L);
+		int SetIntensity(lua_State* L);
 		int SetColor(lua_State* L);
 		int SetCastShadow(lua_State* L);
+		int SetVolumetricsEnabled(lua_State* L);
+		int SetOuterConeAngle(lua_State* L);
+		int SetInnerConeAngle(lua_State* L);
+
+		// back-compat:
+		int SetEnergy(lua_State* L);
 		int SetFOV(lua_State* L);
 
 		int GetType(lua_State* L);

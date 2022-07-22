@@ -256,9 +256,9 @@ static Atlas_Dim GenerateMeshAtlas(MeshComponent& meshcomponent, uint32_t resolu
 }
 
 
-void ObjectWindow::Create(EditorComponent* editor)
+void ObjectWindow::Create(EditorComponent* _editor)
 {
-	this->editor = editor;
+	editor = _editor;
 
 	wi::gui::Window::Create("Object Window");
 	SetSize(XMFLOAT2(670, 320));
@@ -280,7 +280,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	renderableCheckBox.SetPos(XMFLOAT2(x, y += step));
 	renderableCheckBox.SetCheck(true);
 	renderableCheckBox.OnClick([&](wi::gui::EventArgs args) {
-		ObjectComponent* object = wi::scene::GetScene().objects.GetComponent(entity);
+		ObjectComponent* object = editor->GetCurrentScene().objects.GetComponent(entity);
 		if (object != nullptr)
 		{
 			object->SetRenderable(args.bValue);
@@ -294,7 +294,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	shadowCheckBox.SetPos(XMFLOAT2(x, y += step));
 	shadowCheckBox.SetCheck(true);
 	shadowCheckBox.OnClick([&](wi::gui::EventArgs args) {
-		ObjectComponent* object = wi::scene::GetScene().objects.GetComponent(entity);
+		ObjectComponent* object = editor->GetCurrentScene().objects.GetComponent(entity);
 		if (object != nullptr)
 		{
 			object->SetCastShadow(args.bValue);
@@ -307,7 +307,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	ditherSlider.SetSize(XMFLOAT2(100, hei));
 	ditherSlider.SetPos(XMFLOAT2(x, y += step));
 	ditherSlider.OnSlide([&](wi::gui::EventArgs args) {
-		ObjectComponent* object = wi::scene::GetScene().objects.GetComponent(entity);
+		ObjectComponent* object = editor->GetCurrentScene().objects.GetComponent(entity);
 		if (object != nullptr)
 		{
 			object->color.w = 1 - args.fValue;
@@ -320,7 +320,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	cascadeMaskSlider.SetSize(XMFLOAT2(100, hei));
 	cascadeMaskSlider.SetPos(XMFLOAT2(x, y += step));
 	cascadeMaskSlider.OnSlide([&](wi::gui::EventArgs args) {
-		ObjectComponent* object = wi::scene::GetScene().objects.GetComponent(entity);
+		ObjectComponent* object = editor->GetCurrentScene().objects.GetComponent(entity);
 		if (object != nullptr)
 		{
 			object->cascadeMask = (uint32_t)args.iValue;
@@ -333,7 +333,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	lodSlider.SetSize(XMFLOAT2(100, hei));
 	lodSlider.SetPos(XMFLOAT2(x, y += step));
 	lodSlider.OnSlide([&](wi::gui::EventArgs args) {
-		ObjectComponent* object = wi::scene::GetScene().objects.GetComponent(entity);
+		ObjectComponent* object = editor->GetCurrentScene().objects.GetComponent(entity);
 		if (object != nullptr)
 		{
 			object->lod_distance_multiplier = args.fValue;
@@ -364,7 +364,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 			if (entity == INVALID_ENTITY)
 				return;
 
-			Scene& scene = wi::scene::GetScene();
+			Scene& scene = editor->GetCurrentScene();
 			RigidBodyPhysicsComponent* physicscomponent = scene.rigidbodies.GetComponent(entity);
 
 			if (args.iValue == 0)
@@ -465,7 +465,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	XSlider.SetSize(XMFLOAT2(100, hei));
 	XSlider.SetPos(XMFLOAT2(x, y += step));
 	XSlider.OnSlide([&](wi::gui::EventArgs args) {
-		RigidBodyPhysicsComponent* physicscomponent = wi::scene::GetScene().rigidbodies.GetComponent(entity);
+		RigidBodyPhysicsComponent* physicscomponent = editor->GetCurrentScene().rigidbodies.GetComponent(entity);
 		if (physicscomponent != nullptr)
 		{
 			switch (physicscomponent->shape)
@@ -490,7 +490,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	YSlider.SetSize(XMFLOAT2(100, hei));
 	YSlider.SetPos(XMFLOAT2(x, y += step));
 	YSlider.OnSlide([&](wi::gui::EventArgs args) {
-		RigidBodyPhysicsComponent* physicscomponent = wi::scene::GetScene().rigidbodies.GetComponent(entity);
+		RigidBodyPhysicsComponent* physicscomponent = editor->GetCurrentScene().rigidbodies.GetComponent(entity);
 		if (physicscomponent != nullptr)
 		{
 			switch (physicscomponent->shape)
@@ -512,7 +512,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	ZSlider.SetSize(XMFLOAT2(100, hei));
 	ZSlider.SetPos(XMFLOAT2(x, y += step));
 	ZSlider.OnSlide([&](wi::gui::EventArgs args) {
-		RigidBodyPhysicsComponent* physicscomponent = wi::scene::GetScene().rigidbodies.GetComponent(entity);
+		RigidBodyPhysicsComponent* physicscomponent = editor->GetCurrentScene().rigidbodies.GetComponent(entity);
 		if (physicscomponent != nullptr)
 		{
 			switch (physicscomponent->shape)
@@ -532,7 +532,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	massSlider.SetSize(XMFLOAT2(100, hei));
 	massSlider.SetPos(XMFLOAT2(x, y += step));
 	massSlider.OnSlide([&](wi::gui::EventArgs args) {
-		RigidBodyPhysicsComponent* physicscomponent = wi::scene::GetScene().rigidbodies.GetComponent(entity);
+		RigidBodyPhysicsComponent* physicscomponent = editor->GetCurrentScene().rigidbodies.GetComponent(entity);
 		if (physicscomponent != nullptr)
 		{
 			physicscomponent->mass = args.fValue;
@@ -545,7 +545,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	frictionSlider.SetSize(XMFLOAT2(100, hei));
 	frictionSlider.SetPos(XMFLOAT2(x, y += step));
 	frictionSlider.OnSlide([&](wi::gui::EventArgs args) {
-		RigidBodyPhysicsComponent* physicscomponent = wi::scene::GetScene().rigidbodies.GetComponent(entity);
+		RigidBodyPhysicsComponent* physicscomponent = editor->GetCurrentScene().rigidbodies.GetComponent(entity);
 		if (physicscomponent != nullptr)
 		{
 			physicscomponent->friction = args.fValue;
@@ -558,7 +558,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	restitutionSlider.SetSize(XMFLOAT2(100, hei));
 	restitutionSlider.SetPos(XMFLOAT2(x, y += step));
 	restitutionSlider.OnSlide([&](wi::gui::EventArgs args) {
-		RigidBodyPhysicsComponent* physicscomponent = wi::scene::GetScene().rigidbodies.GetComponent(entity);
+		RigidBodyPhysicsComponent* physicscomponent = editor->GetCurrentScene().rigidbodies.GetComponent(entity);
 		if (physicscomponent != nullptr)
 		{
 			physicscomponent->restitution = args.fValue;
@@ -571,7 +571,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	lineardampingSlider.SetSize(XMFLOAT2(100, hei));
 	lineardampingSlider.SetPos(XMFLOAT2(x, y += step));
 	lineardampingSlider.OnSlide([&](wi::gui::EventArgs args) {
-		RigidBodyPhysicsComponent* physicscomponent = wi::scene::GetScene().rigidbodies.GetComponent(entity);
+		RigidBodyPhysicsComponent* physicscomponent = editor->GetCurrentScene().rigidbodies.GetComponent(entity);
 		if (physicscomponent != nullptr)
 		{
 			physicscomponent->damping_linear = args.fValue;
@@ -580,11 +580,11 @@ void ObjectWindow::Create(EditorComponent* editor)
 	AddWidget(&lineardampingSlider);
 
 	angulardampingSlider.Create(0, 1, 0, 100000, "Angular Damping: ");
-	angulardampingSlider.SetTooltip("Set the mass amount for the physics engine.");
+	angulardampingSlider.SetTooltip("Set the angular damping amount for the physics engine.");
 	angulardampingSlider.SetSize(XMFLOAT2(100, hei));
 	angulardampingSlider.SetPos(XMFLOAT2(x, y += step));
 	angulardampingSlider.OnSlide([&](wi::gui::EventArgs args) {
-		RigidBodyPhysicsComponent* physicscomponent = wi::scene::GetScene().rigidbodies.GetComponent(entity);
+		RigidBodyPhysicsComponent* physicscomponent = editor->GetCurrentScene().rigidbodies.GetComponent(entity);
 		if (physicscomponent != nullptr)
 		{
 			physicscomponent->damping_angular = args.fValue;
@@ -592,13 +592,31 @@ void ObjectWindow::Create(EditorComponent* editor)
 		});
 	AddWidget(&angulardampingSlider);
 
+	physicsMeshLODSlider.Create(0, 6, 0, 6, "Physics Mesh LOD: ");
+	physicsMeshLODSlider.SetTooltip("Specify which LOD to use for triangle mesh physics.");
+	physicsMeshLODSlider.SetSize(XMFLOAT2(100, hei));
+	physicsMeshLODSlider.SetPos(XMFLOAT2(x, y += step));
+	physicsMeshLODSlider.OnSlide([&](wi::gui::EventArgs args) {
+		RigidBodyPhysicsComponent* physicscomponent = editor->GetCurrentScene().rigidbodies.GetComponent(entity);
+		if (physicscomponent != nullptr)
+		{
+			if (physicscomponent->mesh_lod != uint32_t(args.iValue))
+			{
+				physicscomponent->physicsobject = nullptr; // will be recreated automatically
+				physicscomponent->mesh_lod = uint32_t(args.iValue);
+			}
+			physicscomponent->mesh_lod = uint32_t(args.iValue);
+		}
+		});
+	AddWidget(&physicsMeshLODSlider);
+
 	kinematicCheckBox.Create("Kinematic: ");
 	kinematicCheckBox.SetTooltip("Toggle kinematic behaviour.");
 	kinematicCheckBox.SetSize(XMFLOAT2(hei, hei));
 	kinematicCheckBox.SetPos(XMFLOAT2(x, y += step));
 	kinematicCheckBox.SetCheck(false);
 	kinematicCheckBox.OnClick([&](wi::gui::EventArgs args) {
-		RigidBodyPhysicsComponent* physicscomponent = wi::scene::GetScene().rigidbodies.GetComponent(entity);
+		RigidBodyPhysicsComponent* physicscomponent = editor->GetCurrentScene().rigidbodies.GetComponent(entity);
 		if (physicscomponent != nullptr)
 		{
 			physicscomponent->SetKinematic(args.bValue);
@@ -612,7 +630,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	disabledeactivationCheckBox.SetPos(XMFLOAT2(x, y += step));
 	disabledeactivationCheckBox.SetCheck(false);
 	disabledeactivationCheckBox.OnClick([&](wi::gui::EventArgs args) {
-		RigidBodyPhysicsComponent* physicscomponent = wi::scene::GetScene().rigidbodies.GetComponent(entity);
+		RigidBodyPhysicsComponent* physicscomponent = editor->GetCurrentScene().rigidbodies.GetComponent(entity);
 		if (physicscomponent != nullptr)
 		{
 			physicscomponent->SetDisableDeactivation(args.bValue);
@@ -651,7 +669,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	generateLightmapButton.SetSize(XMFLOAT2(140, hei));
 	generateLightmapButton.OnClick([&](wi::gui::EventArgs args) {
 
-		Scene& scene = wi::scene::GetScene();
+		Scene& scene = editor->GetCurrentScene();
 
 		enum UV_GEN_TYPE
 		{
@@ -732,7 +750,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	stopLightmapGenButton.SetSize(XMFLOAT2(140, hei));
 	stopLightmapGenButton.OnClick([&](wi::gui::EventArgs args) {
 
-		Scene& scene = wi::scene::GetScene();
+		Scene& scene = editor->GetCurrentScene();
 
 		for (auto& x : this->editor->translator.selected)
 		{
@@ -753,7 +771,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	clearLightmapButton.SetSize(XMFLOAT2(140, hei));
 	clearLightmapButton.OnClick([&](wi::gui::EventArgs args) {
 
-		Scene& scene = wi::scene::GetScene();
+		Scene& scene = editor->GetCurrentScene();
 
 		for (auto& x : this->editor->translator.selected)
 		{
@@ -782,7 +800,7 @@ void ObjectWindow::Create(EditorComponent* editor)
 	colorPicker.SetVisible(true);
 	colorPicker.SetEnabled(true);
 	colorPicker.OnColorChanged([&](wi::gui::EventArgs args) {
-		ObjectComponent* object = wi::scene::GetScene().objects.GetComponent(entity);
+		ObjectComponent* object = editor->GetCurrentScene().objects.GetComponent(entity);
 		if (object != nullptr)
 		{
 			switch (colorComboBox.GetSelected())
@@ -817,7 +835,7 @@ void ObjectWindow::SetEntity(Entity entity)
 
 	this->entity = entity;
 
-	Scene& scene = wi::scene::GetScene();
+	Scene& scene = editor->GetCurrentScene();
 
 	const ObjectComponent* object = scene.objects.GetComponent(entity);
 
@@ -864,6 +882,7 @@ void ObjectWindow::SetEntity(Entity entity)
 		restitutionSlider.SetEnabled(true);
 		lineardampingSlider.SetEnabled(true);
 		angulardampingSlider.SetEnabled(true);
+		physicsMeshLODSlider.SetEnabled(true);
 
 		if (physicsComponent != nullptr)
 		{
@@ -872,6 +891,7 @@ void ObjectWindow::SetEntity(Entity entity)
 			restitutionSlider.SetValue(physicsComponent->restitution);
 			lineardampingSlider.SetValue(physicsComponent->damping_linear);
 			angulardampingSlider.SetValue(physicsComponent->damping_angular);
+			physicsMeshLODSlider.SetValue(float(physicsComponent->mesh_lod));
 
 			kinematicCheckBox.SetCheck(physicsComponent->IsKinematic());
 			disabledeactivationCheckBox.SetCheck(physicsComponent->IsDisableDeactivation());

@@ -1295,6 +1295,12 @@ namespace dx12_internal
 				}
 			}
 		}
+
+		// These will allow to use D3D12CalcSubresource() and loop over D3D12 subresource indices which the descriptor includes:
+		uint32_t firstMip = 0;
+		uint32_t mipCount = 0;
+		uint32_t firstSlice = 0;
+		uint32_t sliceCount = 0;
 	};
 
 	struct Resource_DX12
@@ -1308,9 +1314,13 @@ namespace dx12_internal
 		wi::vector<SingleDescriptor> subresources_uav;
 		SingleDescriptor uav_raw;
 
-		D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
-
 		D3D12_GPU_VIRTUAL_ADDRESS gpu_address = 0;
+
+		UINT64 total_size = 0;
+		wi::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints;
+		wi::vector<UINT64> rowSizesInBytes;
+		wi::vector<UINT> numRows;
+		wi::vector<SubresourceData> mapped_subresources;
 
 		virtual ~Resource_DX12()
 		{
@@ -1465,10 +1475,8 @@ namespace dx12_internal
 	};
 	struct RenderPass_DX12
 	{
-		D3D12_RESOURCE_BARRIER barrierdescs_begin[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
-		uint32_t num_barriers_begin = 0;
-		D3D12_RESOURCE_BARRIER barrierdescs_end[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
-		uint32_t num_barriers_end = 0;
+		wi::vector<D3D12_RESOURCE_BARRIER> barrierdescs_begin;
+		wi::vector<D3D12_RESOURCE_BARRIER> barrierdescs_end;
 
 		D3D12_RENDER_PASS_FLAGS flags = D3D12_RENDER_PASS_FLAG_NONE;
 		uint32_t rt_count = 0;
@@ -1477,7 +1485,7 @@ namespace dx12_internal
 		const Texture* shading_rate_image = nullptr;
 
 		// Due to a API bug, this resolve_subresources array must be kept alive between BeginRenderpass() and EndRenderpass()!
-		D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS resolve_subresources[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+		wi::vector<D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS> resolve_subresources[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
 	};
 	struct SwapChain_DX12
 	{
@@ -2310,7 +2318,7 @@ using namespace dx12_internal;
 			}
 
 			D3D_FEATURE_LEVEL featurelevels[] = {
-				D3D_FEATURE_LEVEL_12_2,
+				//D3D_FEATURE_LEVEL_12_2,
 				D3D_FEATURE_LEVEL_12_1,
 				D3D_FEATURE_LEVEL_12_0,
 				D3D_FEATURE_LEVEL_11_1,
@@ -2997,7 +3005,7 @@ using namespace dx12_internal;
 		buffer->internal_state = internal_state;
 		buffer->type = GPUResource::Type::BUFFER;
 		buffer->mapped_data = nullptr;
-		buffer->mapped_rowpitch = 0;
+		buffer->mapped_size = 0;
 		buffer->desc = *desc;
 
 		HRESULT hr = E_FAIL;
@@ -3047,8 +3055,6 @@ using namespace dx12_internal;
 			resourceState = D3D12_RESOURCE_STATE_GENERIC_READ;
 		}
 
-		device->GetCopyableFootprints(&resourceDesc, 0, 1, 0, &internal_state->footprint, nullptr, nullptr, nullptr);
-
 		hr = allocationhandler->allocator->CreateResource(
 			&allocationDesc,
 			&resourceDesc,
@@ -3065,14 +3071,14 @@ using namespace dx12_internal;
 		{
 			hr = internal_state->resource->Map(0, nullptr, &buffer->mapped_data);
 			assert(SUCCEEDED(hr));
-			buffer->mapped_rowpitch = static_cast<uint32_t>(desc->size);
+			buffer->mapped_size = static_cast<uint32_t>(desc->size);
 		}
 		else if (desc->usage == Usage::UPLOAD)
 		{
 			D3D12_RANGE read_range = {};
 			hr = internal_state->resource->Map(0, &read_range, &buffer->mapped_data);
 			assert(SUCCEEDED(hr));
-			buffer->mapped_rowpitch = static_cast<uint32_t>(desc->size);
+			buffer->mapped_size = static_cast<uint32_t>(desc->size);
 		}
 
 		// Issue data copy on request:
@@ -3123,7 +3129,9 @@ using namespace dx12_internal;
 		texture->internal_state = internal_state;
 		texture->type = GPUResource::Type::TEXTURE;
 		texture->mapped_data = nullptr;
-		texture->mapped_rowpitch = 0;
+		texture->mapped_size = 0;
+		texture->mapped_subresources = nullptr;
+		texture->mapped_subresource_count = 0;
 		texture->desc = *desc;
 
 		HRESULT hr = E_FAIL;
@@ -3207,14 +3215,33 @@ using namespace dx12_internal;
 			resourceState = D3D12_RESOURCE_STATE_COMMON;
 		}
 
+		if (texture->desc.mip_levels == 0)
+		{
+			texture->desc.mip_levels = (uint32_t)log2(std::max(texture->desc.width, texture->desc.height)) + 1;
+		}
+
+		internal_state->total_size = 0;
+		internal_state->footprints.resize(desc->array_size * std::max(1u, desc->mip_levels));
+		internal_state->rowSizesInBytes.resize(internal_state->footprints.size());
+		internal_state->numRows.resize(internal_state->footprints.size());
+		device->GetCopyableFootprints(
+			&resourcedesc,
+			0,
+			(UINT)internal_state->footprints.size(),
+			0,
+			internal_state->footprints.data(),
+			internal_state->numRows.data(),
+			internal_state->rowSizesInBytes.data(),
+			&internal_state->total_size
+		);
+
 		if (texture->desc.usage == Usage::READBACK || texture->desc.usage == Usage::UPLOAD)
 		{
-			UINT64 RequiredSize = 0;
-			device->GetCopyableFootprints(&resourcedesc, 0, 1, 0, &internal_state->footprint, nullptr, nullptr, &RequiredSize);
 			resourcedesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-			resourcedesc.Width = RequiredSize;
+			resourcedesc.Width = internal_state->total_size;
 			resourcedesc.Height = 1;
 			resourcedesc.DepthOrArraySize = 1;
+			resourcedesc.MipLevels = 1;
 			resourcedesc.Format = DXGI_FORMAT_UNKNOWN;
 			resourcedesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 			resourcedesc.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -3245,54 +3272,54 @@ using namespace dx12_internal;
 		{
 			hr = internal_state->resource->Map(0, nullptr, &texture->mapped_data);
 			assert(SUCCEEDED(hr));
-			texture->mapped_rowpitch = internal_state->footprint.Footprint.RowPitch;
 		}
 		else if(texture->desc.usage == Usage::UPLOAD)
 		{
 			D3D12_RANGE read_range = {};
 			hr = internal_state->resource->Map(0, &read_range, &texture->mapped_data);
 			assert(SUCCEEDED(hr));
-			texture->mapped_rowpitch = internal_state->footprint.Footprint.RowPitch;
 		}
 
-		if (texture->desc.mip_levels == 0)
+		if (texture->mapped_data != nullptr)
 		{
-			texture->desc.mip_levels = (uint32_t)log2(std::max(texture->desc.width, texture->desc.height)) + 1;
+			texture->mapped_size = internal_state->total_size;
+			internal_state->mapped_subresources.resize(internal_state->footprints.size());
+			for (size_t i = 0; i < internal_state->footprints.size(); ++i)
+			{
+				internal_state->mapped_subresources[i].data_ptr = (uint8_t*)texture->mapped_data + internal_state->footprints[i].Offset;
+				internal_state->mapped_subresources[i].row_pitch = internal_state->footprints[i].Footprint.RowPitch;
+				internal_state->mapped_subresources[i].slice_pitch = internal_state->footprints[i].Footprint.RowPitch * internal_state->footprints[i].Footprint.Height;
+			}
+			texture->mapped_subresources = internal_state->mapped_subresources.data();
+			texture->mapped_subresource_count = internal_state->mapped_subresources.size();
 		}
 
 		// Issue data copy on request:
 		if (initial_data != nullptr)
 		{
-			uint32_t dataCount = desc->array_size * std::max(1u, desc->mip_levels);
-			wi::vector<D3D12_SUBRESOURCE_DATA> data(dataCount);
-			for (uint32_t slice = 0; slice < dataCount; ++slice)
+			wi::vector<D3D12_SUBRESOURCE_DATA> data(internal_state->footprints.size());
+			for (size_t i = 0; i < internal_state->footprints.size(); ++i)
 			{
-				data[slice] = _ConvertSubresourceData(initial_data[slice]);
+				data[i] = _ConvertSubresourceData(initial_data[i]);
 			}
 
-			UINT64 RequiredSize = 0;
-			wi::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(dataCount);
-			wi::vector<UINT64> rowSizesInBytes(dataCount);
-			wi::vector<UINT> numRows(dataCount);
-			device->GetCopyableFootprints(&resourcedesc, 0, dataCount, 0, layouts.data(), numRows.data(), rowSizesInBytes.data(), &RequiredSize);
+			auto cmd = copyAllocator.allocate(internal_state->total_size);
 
-			auto cmd = copyAllocator.allocate(RequiredSize);
-
-			for (uint32_t i = 0; i < dataCount; ++i)
+			for (size_t i = 0; i < internal_state->footprints.size(); ++i)
 			{
-				if (rowSizesInBytes[i] > (SIZE_T)-1)
+				if (internal_state->rowSizesInBytes[i] > (SIZE_T)-1)
 					continue;
 				D3D12_MEMCPY_DEST DestData = {};
-				DestData.pData = (void*)((UINT64)cmd.uploadbuffer.mapped_data + layouts[i].Offset);
-				DestData.RowPitch = (SIZE_T)layouts[i].Footprint.RowPitch;
-				DestData.SlicePitch = (SIZE_T)layouts[i].Footprint.RowPitch * (SIZE_T)numRows[i];
-				MemcpySubresource(&DestData, &data[i], (SIZE_T)rowSizesInBytes[i], numRows[i], layouts[i].Footprint.Depth);
+				DestData.pData = (void*)((UINT64)cmd.uploadbuffer.mapped_data + internal_state->footprints[i].Offset);
+				DestData.RowPitch = (SIZE_T)internal_state->footprints[i].Footprint.RowPitch;
+				DestData.SlicePitch = (SIZE_T)internal_state->footprints[i].Footprint.RowPitch * (SIZE_T)internal_state->numRows[i];
+				MemcpySubresource(&DestData, &data[i], (SIZE_T)internal_state->rowSizesInBytes[i], internal_state->numRows[i], internal_state->footprints[i].Footprint.Depth);
 			}
 
-			for (UINT i = 0; i < dataCount; ++i)
+			for (UINT i = 0; i < internal_state->footprints.size(); ++i)
 			{
 				CD3DX12_TEXTURE_COPY_LOCATION Dst(internal_state->resource.Get(), i);
-				CD3DX12_TEXTURE_COPY_LOCATION Src(to_internal(&cmd.uploadbuffer)->resource.Get(), layouts[i]);
+				CD3DX12_TEXTURE_COPY_LOCATION Src(to_internal(&cmd.uploadbuffer)->resource.Get(), internal_state->footprints[i]);
 				cmd.commandList->CopyTextureRegion(
 					&Dst,
 					0,
@@ -3804,22 +3831,34 @@ using namespace dx12_internal;
 							if (resolve_src_counter == resolve_dst_counter)
 							{
 								auto src_internal = to_internal(src.texture);
+								int src_subresource = src.subresource;
+								const SingleDescriptor& src_descriptor = src_subresource < 0 ? src_internal->rtv : src_internal->subresources_rtv[src_subresource];
 
 								D3D12_RENDER_PASS_RENDER_TARGET_DESC& src_RTV = internal_state->RTVs[resolve_src_counter];
 								src_RTV.EndingAccess.Resolve.PreserveResolveSource = src_RTV.EndingAccess.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE;
 								src_RTV.EndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE;
 								src_RTV.EndingAccess.Resolve.Format = clear_value.Format;
 								src_RTV.EndingAccess.Resolve.ResolveMode = D3D12_RESOLVE_MODE_AVERAGE;
-								src_RTV.EndingAccess.Resolve.SubresourceCount = 1;
+								src_RTV.EndingAccess.Resolve.PreserveResolveSource = src_RTV.EndingAccess.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_DISCARD ? FALSE : TRUE;
 								src_RTV.EndingAccess.Resolve.pDstResource = texture_internal->resource.Get();
 								src_RTV.EndingAccess.Resolve.pSrcResource = src_internal->resource.Get();
 
-								src_RTV.EndingAccess.Resolve.pSubresourceParameters = &internal_state->resolve_subresources[resolve_src_counter];
-								internal_state->resolve_subresources[resolve_src_counter].SrcRect.left = 0;
-								internal_state->resolve_subresources[resolve_src_counter].SrcRect.right = (LONG)texture->desc.width;
-								internal_state->resolve_subresources[resolve_src_counter].SrcRect.bottom = (LONG)texture->desc.height;
-								internal_state->resolve_subresources[resolve_src_counter].SrcRect.top = 0;
-
+								const SingleDescriptor& dst_descriptor = subresource < 0 ? texture_internal->srv : texture_internal->subresources_srv[subresource];
+								for (uint32_t mip = 0; mip < std::min(attachment.texture->desc.mip_levels, dst_descriptor.mipCount); ++mip)
+								{
+									for (uint32_t slice = 0; slice < std::min(attachment.texture->desc.array_size, dst_descriptor.sliceCount); ++slice)
+									{
+										D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS& params = internal_state->resolve_subresources[resolve_src_counter].emplace_back();
+										params.SrcSubresource = D3D12CalcSubresource(src_descriptor.firstMip + mip, src_descriptor.firstSlice + slice, 0, src.texture->desc.mip_levels, src.texture->desc.array_size);
+										params.DstSubresource = D3D12CalcSubresource(dst_descriptor.firstMip + mip, dst_descriptor.firstSlice + slice, 0, texture->desc.mip_levels, texture->desc.array_size);
+										params.SrcRect.left = 0;
+										params.SrcRect.top = 0;
+										params.SrcRect.right = (LONG)texture->desc.width;
+										params.SrcRect.bottom = (LONG)texture->desc.height;
+									}
+								}
+								src_RTV.EndingAccess.Resolve.SubresourceCount = (UINT)internal_state->resolve_subresources[resolve_src_counter].size();
+								src_RTV.EndingAccess.Resolve.pSubresourceParameters = internal_state->resolve_subresources[resolve_src_counter].data();
 								break;
 							}
 							resolve_src_counter++;
@@ -3841,28 +3880,60 @@ using namespace dx12_internal;
 			if (attachment.texture == nullptr)
 				continue;
 
+			D3D12_RESOURCE_STATES before = _ParseResourceState(attachment.initial_layout);
+			D3D12_RESOURCE_STATES after = attachment.type == RenderPassAttachment::Type::RESOLVE ? D3D12_RESOURCE_STATE_RESOLVE_DEST : _ParseResourceState(attachment.subpass_layout);
+			if (before == after)
+				continue;
+
 			auto texture_internal = to_internal(attachment.texture);
 
-			D3D12_RESOURCE_BARRIER& barrierdesc = internal_state->barrierdescs_begin[internal_state->num_barriers_begin++];
-
+			D3D12_RESOURCE_BARRIER barrierdesc = {};
 			barrierdesc.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 			barrierdesc.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
 			barrierdesc.Transition.pResource = texture_internal->resource.Get();
-			barrierdesc.Transition.StateBefore = _ParseResourceState(attachment.initial_layout);
-			if (attachment.type == RenderPassAttachment::Type::RESOLVE)
+			barrierdesc.Transition.StateBefore = before;
+			barrierdesc.Transition.StateAfter = after;
+
+			if (attachment.subresource >= 0)
 			{
-				barrierdesc.Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+				// Need to unroll descriptor into multiple subresource barriers:
+				const SingleDescriptor* descriptor = nullptr;
+				if (attachment.type == RenderPassAttachment::Type::RENDERTARGET)
+				{
+					descriptor = &texture_internal->subresources_rtv[attachment.subresource];
+				}
+				else if (attachment.type == RenderPassAttachment::Type::DEPTH_STENCIL)
+				{
+					descriptor = &texture_internal->subresources_dsv[attachment.subresource];
+				}
+				else if (attachment.type == RenderPassAttachment::Type::RESOLVE)
+				{
+					// Single barrier for whole resource:
+					//	From debug layer it looks like the resolve operation requires entire resource to be in RESOLVE_DEST
+					barrierdesc.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+					internal_state->barrierdescs_begin.push_back(barrierdesc);
+					continue;
+				}
+				else
+				{
+					assert(0); // not handled attachment type, this shouldn't happen
+					continue;
+				}
+
+				for (uint32_t mip = descriptor->firstMip; mip < std::min(attachment.texture->desc.mip_levels, descriptor->firstMip + descriptor->mipCount); ++mip)
+				{
+					for (uint32_t slice = descriptor->firstSlice; slice < std::min(attachment.texture->desc.array_size, descriptor->firstSlice + descriptor->sliceCount); ++slice)
+					{
+						barrierdesc.Transition.Subresource = D3D12CalcSubresource(mip, slice, 0, attachment.texture->desc.mip_levels, attachment.texture->desc.array_size);
+						internal_state->barrierdescs_begin.push_back(barrierdesc);
+					}
+				}
 			}
 			else
 			{
-				barrierdesc.Transition.StateAfter = _ParseResourceState(attachment.subpass_layout);
-			}
-			barrierdesc.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-
-			if (barrierdesc.Transition.StateBefore == barrierdesc.Transition.StateAfter)
-			{
-				internal_state->num_barriers_begin--;
-				continue;
+				// Single barrier for whole resource:
+				barrierdesc.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+				internal_state->barrierdescs_begin.push_back(barrierdesc);
 			}
 		}
 
@@ -3872,28 +3943,60 @@ using namespace dx12_internal;
 			if (attachment.texture == nullptr)
 				continue;
 
+			D3D12_RESOURCE_STATES before = attachment.type == RenderPassAttachment::Type::RESOLVE ? D3D12_RESOURCE_STATE_RESOLVE_DEST : _ParseResourceState(attachment.subpass_layout);
+			D3D12_RESOURCE_STATES after = _ParseResourceState(attachment.final_layout);
+			if (before == after)
+				continue;
+
 			auto texture_internal = to_internal(attachment.texture);
 
-			D3D12_RESOURCE_BARRIER& barrierdesc = internal_state->barrierdescs_end[internal_state->num_barriers_end++];
-
+			D3D12_RESOURCE_BARRIER barrierdesc = {};
 			barrierdesc.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 			barrierdesc.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
 			barrierdesc.Transition.pResource = texture_internal->resource.Get();
-			if (attachment.type == RenderPassAttachment::Type::RESOLVE)
+			barrierdesc.Transition.StateBefore = before;
+			barrierdesc.Transition.StateAfter = after;
+
+			if (attachment.subresource >= 0)
 			{
-				barrierdesc.Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+				// Need to unroll descriptor into multiple subresource barriers:
+				const SingleDescriptor* descriptor = nullptr;
+				if (attachment.type == RenderPassAttachment::Type::RENDERTARGET)
+				{
+					descriptor = &texture_internal->subresources_rtv[attachment.subresource];
+				}
+				else if (attachment.type == RenderPassAttachment::Type::DEPTH_STENCIL)
+				{
+					descriptor = &texture_internal->subresources_dsv[attachment.subresource];
+				}
+				else if (attachment.type == RenderPassAttachment::Type::RESOLVE)
+				{
+					// Single barrier for whole resource:
+					//	From debug layer it looks like the resolve operation requires entire resource to be in RESOLVE_DEST
+					barrierdesc.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+					internal_state->barrierdescs_end.push_back(barrierdesc);
+					continue;
+				}
+				else
+				{
+					assert(0); // not handled attachment type, this shouldn't happen
+					continue;
+				}
+
+				for (uint32_t mip = descriptor->firstMip; mip < std::min(attachment.texture->desc.mip_levels, descriptor->firstMip + descriptor->mipCount); ++mip)
+				{
+					for (uint32_t slice = descriptor->firstSlice; slice < std::min(attachment.texture->desc.array_size, descriptor->firstSlice + descriptor->sliceCount); ++slice)
+					{
+						barrierdesc.Transition.Subresource = D3D12CalcSubresource(mip, slice, 0, attachment.texture->desc.mip_levels, attachment.texture->desc.array_size);
+						internal_state->barrierdescs_end.push_back(barrierdesc);
+					}
+				}
 			}
 			else
 			{
-				barrierdesc.Transition.StateBefore = _ParseResourceState(attachment.subpass_layout);
-			}
-			barrierdesc.Transition.StateAfter = _ParseResourceState(attachment.final_layout);
-			barrierdesc.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-
-			if (barrierdesc.Transition.StateBefore == barrierdesc.Transition.StateAfter)
-			{
-				internal_state->num_barriers_end--;
-				continue;
+				// Single barrier for whole resource:
+				barrierdesc.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+				internal_state->barrierdescs_end.push_back(barrierdesc);
 			}
 		}
 
@@ -4265,6 +4368,10 @@ using namespace dx12_internal;
 
 			SingleDescriptor descriptor;
 			descriptor.init(this, srv_desc, internal_state->resource.Get());
+			descriptor.firstMip = firstMip;
+			descriptor.mipCount = mipCount;
+			descriptor.firstSlice = firstSlice;
+			descriptor.sliceCount = sliceCount;
 
 			if (!internal_state->srv.IsValid())
 			{
@@ -4339,6 +4446,10 @@ using namespace dx12_internal;
 
 			SingleDescriptor descriptor;
 			descriptor.init(this, uav_desc, internal_state->resource.Get());
+			descriptor.firstMip = firstMip;
+			descriptor.mipCount = mipCount;
+			descriptor.firstSlice = firstSlice;
+			descriptor.sliceCount = sliceCount;
 
 			if (!internal_state->uav.IsValid())
 			{
@@ -4429,6 +4540,10 @@ using namespace dx12_internal;
 
 			SingleDescriptor descriptor;
 			descriptor.init(this, rtv_desc, internal_state->resource.Get());
+			descriptor.firstMip = firstMip;
+			descriptor.mipCount = mipCount;
+			descriptor.firstSlice = firstSlice;
+			descriptor.sliceCount = sliceCount;
 
 			if (!internal_state->rtv.IsValid())
 			{
@@ -4512,6 +4627,10 @@ using namespace dx12_internal;
 
 			SingleDescriptor descriptor;
 			descriptor.init(this, dsv_desc, internal_state->resource.Get());
+			descriptor.firstMip = firstMip;
+			descriptor.mipCount = mipCount;
+			descriptor.firstSlice = firstSlice;
+			descriptor.sliceCount = sliceCount;
 
 			if (!internal_state->dsv.IsValid())
 			{
@@ -4992,13 +5111,26 @@ using namespace dx12_internal;
 		internal_state->allocationhandler = allocationhandler;
 		internal_state->resource = swapchain_internal->backBuffers[swapchain_internal->swapChain->GetCurrentBackBufferIndex()];
 
-		D3D12_RESOURCE_DESC desc = internal_state->resource->GetDesc();
-		device->GetCopyableFootprints(&desc, 0, 1, 0, &internal_state->footprint, nullptr, nullptr, nullptr);
+		D3D12_RESOURCE_DESC resourcedesc = internal_state->resource->GetDesc();
+		internal_state->total_size = 0;
+		internal_state->footprints.resize(resourcedesc.DepthOrArraySize * resourcedesc.MipLevels);
+		internal_state->rowSizesInBytes.resize(internal_state->footprints.size());
+		internal_state->numRows.resize(internal_state->footprints.size());
+		device->GetCopyableFootprints(
+			&resourcedesc,
+			0,
+			(UINT)internal_state->footprints.size(),
+			0,
+			internal_state->footprints.data(),
+			internal_state->numRows.data(),
+			internal_state->rowSizesInBytes.data(),
+			&internal_state->total_size
+		);
 
 		Texture result;
 		result.type = GPUResource::Type::TEXTURE;
 		result.internal_state = internal_state;
-		result.desc = _ConvertTextureDesc_Inv(desc);
+		result.desc = _ConvertTextureDesc_Inv(resourcedesc);
 		return result;
 	}
 
@@ -5072,9 +5204,9 @@ using namespace dx12_internal;
 
 		auto internal_state = to_internal(commandlist.active_renderpass);
 
-		if (internal_state->num_barriers_begin > 0)
+		if (!internal_state->barrierdescs_begin.empty())
 		{
-			commandlist.GetGraphicsCommandList()->ResourceBarrier(internal_state->num_barriers_begin, internal_state->barrierdescs_begin);
+			commandlist.GetGraphicsCommandList()->ResourceBarrier((UINT)internal_state->barrierdescs_begin.size(), internal_state->barrierdescs_begin.data());
 		}
 
 		if (internal_state->shading_rate_image != nullptr)
@@ -5104,9 +5236,9 @@ using namespace dx12_internal;
 				commandlist.GetGraphicsCommandList()->RSSetShadingRateImage(nullptr);
 			}
 
-			if (internal_state->num_barriers_end > 0)
+			if (!internal_state->barrierdescs_end.empty())
 			{
-				commandlist.GetGraphicsCommandList()->ResourceBarrier(internal_state->num_barriers_end, internal_state->barrierdescs_end);
+				commandlist.GetGraphicsCommandList()->ResourceBarrier((UINT)internal_state->barrierdescs_end.size(), internal_state->barrierdescs_end.data());
 			}
 		}
 
@@ -5512,19 +5644,35 @@ using namespace dx12_internal;
 		CommandList_DX12& commandlist = GetCommandList(cmd);
 		auto internal_state_src = to_internal(pSrc);
 		auto internal_state_dst = to_internal(pDst);
-		D3D12_RESOURCE_DESC desc_src = internal_state_src->resource->GetDesc();
-		D3D12_RESOURCE_DESC desc_dst = internal_state_dst->resource->GetDesc();
-		if (desc_dst.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && desc_src.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+
+		const TextureDesc& src_desc = ((const Texture*)pSrc)->GetDesc();
+		const TextureDesc& dst_desc = ((const Texture*)pDst)->GetDesc();
+
+		if (src_desc.usage == Usage::UPLOAD)
 		{
-			CD3DX12_TEXTURE_COPY_LOCATION Src(internal_state_src->resource.Get(), 0);
-			CD3DX12_TEXTURE_COPY_LOCATION Dst(internal_state_dst->resource.Get(), internal_state_dst->footprint);
-			commandlist.GetGraphicsCommandList()->CopyTextureRegion(&Dst, 0, 0, 0, &Src, nullptr);
+			for (uint32_t layer = 0; layer < dst_desc.array_size; ++layer)
+			{
+				for (uint32_t mip = 0; mip < dst_desc.mip_levels; ++mip)
+				{
+					UINT subresource = D3D12CalcSubresource(mip, layer, 0, dst_desc.mip_levels, dst_desc.array_size);
+					CD3DX12_TEXTURE_COPY_LOCATION Src(internal_state_src->resource.Get(), internal_state_src->footprints[layer * dst_desc.mip_levels + mip]);
+					CD3DX12_TEXTURE_COPY_LOCATION Dst(internal_state_dst->resource.Get(), subresource);
+					commandlist.GetGraphicsCommandList()->CopyTextureRegion(&Dst, 0, 0, 0, &Src, nullptr);
+				}
+			}
 		}
-		else if (desc_src.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && desc_dst.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+		else if (dst_desc.usage == Usage::READBACK)
 		{
-			CD3DX12_TEXTURE_COPY_LOCATION Src(internal_state_src->resource.Get(), internal_state_src->footprint);
-			CD3DX12_TEXTURE_COPY_LOCATION Dst(internal_state_dst->resource.Get(), 0);
-			commandlist.GetGraphicsCommandList()->CopyTextureRegion(&Dst, 0, 0, 0, &Src, nullptr);
+			for (uint32_t layer = 0; layer < dst_desc.array_size; ++layer)
+			{
+				for (uint32_t mip = 0; mip < dst_desc.mip_levels; ++mip)
+				{
+					UINT subresource = D3D12CalcSubresource(mip, layer, 0, dst_desc.mip_levels, dst_desc.array_size);
+					CD3DX12_TEXTURE_COPY_LOCATION Src(internal_state_src->resource.Get(), subresource);
+					CD3DX12_TEXTURE_COPY_LOCATION Dst(internal_state_dst->resource.Get(), internal_state_dst->footprints[layer * dst_desc.mip_levels + mip]);
+					commandlist.GetGraphicsCommandList()->CopyTextureRegion(&Dst, 0, 0, 0, &Src, nullptr);
+				}
+			}
 		}
 		else
 		{
@@ -5658,7 +5806,6 @@ using namespace dx12_internal;
 				continue;
 
 			D3D12_RESOURCE_BARRIER barrierdesc = {};
-			bool skip_barrier = false;
 
 			switch (barrier.type)
 			{
@@ -5673,78 +5820,67 @@ using namespace dx12_internal;
 			case GPUBarrier::Type::IMAGE:
 			{
 				auto internal_state = to_internal(barrier.image.texture);
-
-				if (barrier.image.layout_before == ResourceState::UNDEFINED)
+				barrierdesc.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				barrierdesc.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+				barrierdesc.Transition.pResource = internal_state->resource.Get();
+				barrierdesc.Transition.StateBefore = _ParseResourceState(barrier.image.layout_before);
+				barrierdesc.Transition.StateAfter = _ParseResourceState(barrier.image.layout_after);
+				if (barrier.image.mip >= 0 || barrier.image.slice >= 0)
 				{
-					skip_barrier = true;
-					if (barrier.image.mip >= 0 || barrier.image.slice >= 0)
-					{
-						D3D12_DISCARD_REGION region = {};
-						region.FirstSubresource = D3D12CalcSubresource(
-							(UINT)std::max(0, barrier.image.mip),
-							(UINT)std::max(0, barrier.image.slice),
-							0,
-							barrier.image.texture->desc.mip_levels,
-							barrier.image.texture->desc.array_size
-						);
-						region.NumSubresources = 1;
-						region.NumRects = 0;
-						region.pRects = nullptr;
-						commandlist.GetGraphicsCommandList()->DiscardResource(internal_state->resource.Get(), &region);
-					}
-					else
-					{
-						commandlist.GetGraphicsCommandList()->DiscardResource(internal_state->resource.Get(), nullptr);
-					}
+					barrierdesc.Transition.Subresource = D3D12CalcSubresource(
+						(UINT)std::max(0, barrier.image.mip),
+						(UINT)std::max(0, barrier.image.slice),
+						0,
+						barrier.image.texture->desc.mip_levels,
+						barrier.image.texture->desc.array_size
+					);
 				}
 				else
 				{
-					barrierdesc.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-					barrierdesc.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-					barrierdesc.Transition.pResource = internal_state->resource.Get();
-					barrierdesc.Transition.StateBefore = _ParseResourceState(barrier.image.layout_before);
-					barrierdesc.Transition.StateAfter = _ParseResourceState(barrier.image.layout_after);
+					barrierdesc.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+				}
+
+				if (barrier.image.layout_before == ResourceState::UNDEFINED)
+				{
+					CommandList_DX12::Discard& discard = commandlist.discards.emplace_back();
+					discard.resource = internal_state->resource.Get();
+
 					if (barrier.image.mip >= 0 || barrier.image.slice >= 0)
 					{
-						barrierdesc.Transition.Subresource = D3D12CalcSubresource(
+						discard.region.FirstSubresource = D3D12CalcSubresource(
 							(UINT)std::max(0, barrier.image.mip),
 							(UINT)std::max(0, barrier.image.slice),
 							0,
 							barrier.image.texture->desc.mip_levels,
 							barrier.image.texture->desc.array_size
 						);
+						discard.region.NumSubresources = 1;
+						discard.region.NumRects = 0;
+						discard.region.pRects = nullptr;
 					}
-					else
-					{
-						barrierdesc.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-					}
+
+					barrierdesc.Transition.StateBefore = _ParseResourceState(barrier.image.texture->desc.layout);
 				}
 			}
 			break;
 			case GPUBarrier::Type::BUFFER:
 			{
 				auto internal_state = to_internal(barrier.buffer.buffer);
+				barrierdesc.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				barrierdesc.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+				barrierdesc.Transition.pResource = internal_state->resource.Get();
+				barrierdesc.Transition.StateBefore = _ParseResourceState(barrier.buffer.state_before);
+				barrierdesc.Transition.StateAfter = _ParseResourceState(barrier.buffer.state_after);
+				barrierdesc.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
 				if (barrier.buffer.state_before == ResourceState::UNDEFINED)
 				{
-					skip_barrier = true;
-					commandlist.GetGraphicsCommandList()->DiscardResource(internal_state->resource.Get(), nullptr);
-				}
-				else
-				{
-					barrierdesc.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-					barrierdesc.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-					barrierdesc.Transition.pResource = internal_state->resource.Get();
-					barrierdesc.Transition.StateBefore = _ParseResourceState(barrier.buffer.state_before);
-					barrierdesc.Transition.StateAfter = _ParseResourceState(barrier.buffer.state_after);
-					barrierdesc.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+					CommandList_DX12::Discard& discard = commandlist.discards.emplace_back();
+					discard.resource = internal_state->resource.Get();
 				}
 			}
 			break;
 			}
-
-			if (skip_barrier)
-				continue;
 
 			if (barrierdesc.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && commandlist.queue > QUEUE_GRAPHICS)
 			{
@@ -5763,6 +5899,15 @@ using namespace dx12_internal;
 				barrierdescs.data()
 			);
 			barrierdescs.clear();
+		}
+
+		if (!commandlist.discards.empty())
+		{
+			for (auto& discard : commandlist.discards)
+			{
+				commandlist.GetGraphicsCommandList()->DiscardResource(discard.resource, discard.region.NumSubresources > 0 ? &discard.region : nullptr);
+			}
+			commandlist.discards.clear();
 		}
 	}
 	void GraphicsDevice_DX12::BuildRaytracingAccelerationStructure(const RaytracingAccelerationStructure* dst, CommandList cmd, const RaytracingAccelerationStructure* src)

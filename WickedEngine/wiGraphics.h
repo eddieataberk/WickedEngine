@@ -344,6 +344,7 @@ namespace wi::graphics
 		BUFFER_STRUCTURED = 1 << 3,
 		RAY_TRACING = 1 << 4,
 		PREDICATION = 1 << 5,
+		TRANSIENT_ATTACHMENT = 1 << 6,	// hint: used in renderpass, without needing to write content to memory (VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)
 	};
 
 	enum class GraphicsDeviceCapability
@@ -443,9 +444,9 @@ namespace wi::graphics
 			TEXTURE_2D,
 			TEXTURE_3D,
 		} type = Type::TEXTURE_2D;
-		uint32_t width = 0;
-		uint32_t height = 0;
-		uint32_t depth = 0;
+		uint32_t width = 1;
+		uint32_t height = 1;
+		uint32_t depth = 1;
 		uint32_t array_size = 1;
 		uint32_t mip_levels = 1;
 		Format format = Format::UNKNOWN;
@@ -656,7 +657,8 @@ namespace wi::graphics
 			StoreOp store_op = StoreOp::STORE,
 			ResourceState initial_layout = ResourceState::SHADER_RESOURCE,
 			ResourceState subpass_layout = ResourceState::RENDERTARGET,
-			ResourceState final_layout = ResourceState::SHADER_RESOURCE
+			ResourceState final_layout = ResourceState::SHADER_RESOURCE,
+			int subresource_RTV = -1
 		)
 		{
 			RenderPassAttachment attachment;
@@ -667,6 +669,7 @@ namespace wi::graphics
 			attachment.initial_layout = initial_layout;
 			attachment.subpass_layout = subpass_layout;
 			attachment.final_layout = final_layout;
+			attachment.subresource = subresource_RTV;
 			return attachment;
 		}
 
@@ -676,7 +679,8 @@ namespace wi::graphics
 			StoreOp store_op = StoreOp::STORE,
 			ResourceState initial_layout = ResourceState::DEPTHSTENCIL,
 			ResourceState subpass_layout = ResourceState::DEPTHSTENCIL,
-			ResourceState final_layout = ResourceState::DEPTHSTENCIL
+			ResourceState final_layout = ResourceState::DEPTHSTENCIL,
+			int subresource_DSV = -1
 		)
 		{
 			RenderPassAttachment attachment;
@@ -687,13 +691,15 @@ namespace wi::graphics
 			attachment.initial_layout = initial_layout;
 			attachment.subpass_layout = subpass_layout;
 			attachment.final_layout = final_layout;
+			attachment.subresource = subresource_DSV;
 			return attachment;
 		}
 
 		static RenderPassAttachment Resolve(
 			const Texture* resource = nullptr,
 			ResourceState initial_layout = ResourceState::SHADER_RESOURCE,
-			ResourceState final_layout = ResourceState::SHADER_RESOURCE
+			ResourceState final_layout = ResourceState::SHADER_RESOURCE,
+			int subresource_SRV = -1
 		)
 		{
 			RenderPassAttachment attachment;
@@ -701,6 +707,7 @@ namespace wi::graphics
 			attachment.texture = resource;
 			attachment.initial_layout = initial_layout;
 			attachment.final_layout = final_layout;
+			attachment.subresource = subresource_SRV;
 			return attachment;
 		}
 
@@ -769,9 +776,9 @@ namespace wi::graphics
 
 	struct SubresourceData
 	{
-		const void* data_ptr = nullptr;
-		uint32_t row_pitch = 0;
-		uint32_t slice_pitch = 0;
+		const void* data_ptr = nullptr;	// pointer to the beginning of the subresource data (pointer to beginning of resource + subresource offset)
+		uint32_t row_pitch = 0;			// bytes between two rows of a texture (2D and 3D textures)
+		uint32_t slice_pitch = 0;		// bytes between two depth slices of a texture (3D textures only)
 	};
 
 	struct Rect
@@ -816,8 +823,9 @@ namespace wi::graphics
 		constexpr bool IsBuffer() const { return type == Type::BUFFER; }
 		constexpr bool IsAccelerationStructure() const { return type == Type::RAYTRACING_ACCELERATION_STRUCTURE; }
 
-		void* mapped_data = nullptr;
-		uint32_t mapped_rowpitch = 0;
+		// These are only valid if the resource was created with CPU access (USAGE::UPLOAD or USAGE::READBACK)
+		void* mapped_data = nullptr;	// for buffers, it is a pointer to the buffer data; for textures, it is a pointer to texture data with linear tiling;
+		size_t mapped_size = 0;			// for buffers, it is the full buffer size; for textures it is the full texture size including all subresources;
 	};
 
 	struct GPUBuffer : public GPUResource
@@ -830,6 +838,10 @@ namespace wi::graphics
 	struct Texture : public GPUResource
 	{
 		TextureDesc	desc;
+
+		// These are only valid if the texture was created with CPU access (USAGE::UPLOAD or USAGE::READBACK)
+		const SubresourceData* mapped_subresources = nullptr;	// an array of subresource mappings in the following memory layout: slice0|mip0, slice0|mip1, slice0|mip2, ... sliceN|mipN
+		size_t mapped_subresource_count = 0;					// the array size of mapped_subresources (number of slices * number of miplevels)
 
 		constexpr const TextureDesc& GetDesc() const { return desc; }
 	};

@@ -693,7 +693,7 @@ namespace vulkan_internal
 		wi::vector<VkImageView> subresources_dsv;
 		wi::vector<uint32_t> subresources_framebuffer_layercount;
 
-		VkSubresourceLayout subresourcelayout = {};
+		wi::vector<SubresourceData> mapped_subresources;
 
 		~Texture_Vulkan()
 		{
@@ -2485,6 +2485,11 @@ using namespace vulkan_internal;
 
 				enabled_deviceExtensions = required_deviceExtensions;
 
+				if (checkExtensionSupport(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME, available_deviceExtensions))
+				{
+					// The shader compiler can still be using this extension, even though it is core in Vulkan 1.2, so enable it for now:
+					enabled_deviceExtensions.push_back(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME);
+				}
 				if (checkExtensionSupport(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME, available_deviceExtensions))
 				{
 					enabled_deviceExtensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
@@ -3460,7 +3465,7 @@ using namespace vulkan_internal;
 		buffer->internal_state = internal_state;
 		buffer->type = GPUResource::Type::BUFFER;
 		buffer->mapped_data = nullptr;
-		buffer->mapped_rowpitch = 0;
+		buffer->mapped_size = 0;
 		buffer->desc = *desc;
 
 		VkBufferCreateInfo bufferInfo = {};
@@ -3549,7 +3554,7 @@ using namespace vulkan_internal;
 		if (desc->usage == Usage::READBACK || desc->usage == Usage::UPLOAD)
 		{
 			buffer->mapped_data = internal_state->allocation->GetMappedData();
-			buffer->mapped_rowpitch = static_cast<uint32_t>(desc->size);
+			buffer->mapped_size = internal_state->allocation->GetSize();
 		}
 
 		if (bufferInfo.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
@@ -3663,7 +3668,9 @@ using namespace vulkan_internal;
 		texture->internal_state = internal_state;
 		texture->type = GPUResource::Type::TEXTURE;
 		texture->mapped_data = nullptr;
-		texture->mapped_rowpitch = 0;
+		texture->mapped_size = 0;
+		texture->mapped_subresources = nullptr;
+		texture->mapped_subresource_count = 0;
 		texture->desc = *desc;
 
 		if (texture->desc.mip_levels == 0)
@@ -3678,7 +3685,7 @@ using namespace vulkan_internal;
 		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 		imageInfo.extent.width = texture->desc.width;
 		imageInfo.extent.height = texture->desc.height;
-		imageInfo.extent.depth = 1;
+		imageInfo.extent.depth = texture->desc.depth;
 		imageInfo.format = _ConvertFormat(texture->desc.format);
 		imageInfo.arrayLayers = texture->desc.array_size;
 		imageInfo.mipLevels = texture->desc.mip_levels;
@@ -3708,8 +3715,15 @@ using namespace vulkan_internal;
 		{
 			imageInfo.usage |= VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
 		}
-		imageInfo.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-		imageInfo.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		if (has_flag(texture->desc.misc_flags, ResourceMiscFlag::TRANSIENT_ATTACHMENT))
+		{
+			imageInfo.usage |= VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+		}
+		else
+		{
+			imageInfo.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+			imageInfo.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		}
 
 		imageInfo.flags = 0;
 		if (has_flag(texture->desc.misc_flags, ResourceMiscFlag::TEXTURECUBE))
@@ -3742,7 +3756,6 @@ using namespace vulkan_internal;
 			break;
 		case TextureDesc::Type::TEXTURE_3D:
 			imageInfo.imageType = VK_IMAGE_TYPE_3D;
-			imageInfo.extent.depth = texture->desc.depth;
 			break;
 		default:
 			assert(0);
@@ -3755,12 +3768,23 @@ using namespace vulkan_internal;
 		{
 			VkBufferCreateInfo bufferInfo = {};
 			bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-			bufferInfo.size =
-				imageInfo.extent.width *
-				imageInfo.extent.height *
-				imageInfo.extent.depth *
-				imageInfo.arrayLayers *
-				GetFormatStride(texture->desc.format);
+			bufferInfo.size = 0;
+			const uint32_t data_stride = GetFormatStride(texture->desc.format);
+			const uint32_t block_size = GetFormatBlockSize(texture->desc.format);
+			const uint32_t num_blocks_x = texture->desc.width / block_size;
+			const uint32_t num_blocks_y = texture->desc.height / block_size;
+			uint32_t mip_width = num_blocks_x;
+			uint32_t mip_height = num_blocks_y;
+			uint32_t mip_depth = texture->desc.depth;
+			for (uint32_t mip = 0; mip < texture->desc.mip_levels; ++mip)
+			{
+				bufferInfo.size += mip_width * mip_height * mip_depth;
+				mip_width = std::max(1u, mip_width / 2);
+				mip_height = std::max(1u, mip_height / 2);
+				mip_depth = std::max(1u, mip_depth / 2);
+			}
+			bufferInfo.size *= imageInfo.arrayLayers;
+			bufferInfo.size *= data_stride;
 
 			allocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
 			if (texture->desc.usage == Usage::READBACK)
@@ -3778,18 +3802,43 @@ using namespace vulkan_internal;
 			assert(res == VK_SUCCESS);
 
 			imageInfo.tiling = VK_IMAGE_TILING_LINEAR;
+			imageInfo.mipLevels = 1; // set miplevels to 1 for linear tiling resource (this resource is just temporary)
 			VkImage image;
 			res = vkCreateImage(device, &imageInfo, nullptr, &image);
 			assert(res == VK_SUCCESS);
 
+			VkSubresourceLayout subresourcelayout = {};
 			VkImageSubresource subresource = {};
 			subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-			vkGetImageSubresourceLayout(device, image, &subresource, &internal_state->subresourcelayout);
+			vkGetImageSubresourceLayout(device, image, &subresource, &subresourcelayout);
 
 			if (texture->desc.usage == Usage::READBACK || texture->desc.usage == Usage::UPLOAD)
 			{
 				texture->mapped_data = internal_state->allocation->GetMappedData();
-				texture->mapped_rowpitch = (uint32_t)internal_state->subresourcelayout.rowPitch;
+				texture->mapped_size = internal_state->allocation->GetSize();
+
+				internal_state->mapped_subresources.resize(texture->desc.array_size* texture->desc.mip_levels);
+				size_t subresourceIndex = 0;
+				size_t subresourceDataOffset = 0;
+				for (uint32_t layer = 0; layer < texture->desc.array_size; ++layer)
+				{
+					uint32_t rowpitch = (uint32_t)subresourcelayout.rowPitch;
+					uint32_t slicepitch = (uint32_t)subresourcelayout.depthPitch;
+					uint32_t mip_width = num_blocks_x;
+					for (uint32_t mip = 0; mip < texture->desc.mip_levels; ++mip)
+					{
+						SubresourceData& subresourcedata = internal_state->mapped_subresources[subresourceIndex++];
+						subresourcedata.data_ptr = (uint8_t*)texture->mapped_data + subresourceDataOffset;
+						subresourcedata.row_pitch = rowpitch;
+						subresourcedata.slice_pitch = slicepitch;
+						subresourceDataOffset += std::max(rowpitch * mip_width, slicepitch);
+						rowpitch = std::max(data_stride, rowpitch / 2);
+						slicepitch = std::max(data_stride, slicepitch / 4); // squared reduction
+						mip_width = std::max(1u, mip_width / 2);
+					}
+				}
+				texture->mapped_subresources = internal_state->mapped_subresources.data();
+				texture->mapped_subresource_count = internal_state->mapped_subresources.size();
 			}
 
 			vkDestroyImage(device, image, nullptr);
@@ -3819,8 +3868,8 @@ using namespace vulkan_internal;
 				{
 					const SubresourceData& subresourceData = initial_data[initDataIdx++];
 					const uint32_t block_size = GetFormatBlockSize(desc->format);
-					const uint32_t num_blocks_x = width / block_size;
-					const uint32_t num_blocks_y = height / block_size;
+					const uint32_t num_blocks_x = std::max(1u, width / block_size);
+					const uint32_t num_blocks_y = std::max(1u, height / block_size);
 					const uint32_t dst_rowpitch = num_blocks_x * GetFormatStride(desc->format);
 					const uint32_t dst_slicepitch = dst_rowpitch * num_blocks_y;
 					const uint32_t src_rowpitch = subresourceData.row_pitch;
@@ -4962,23 +5011,46 @@ using namespace vulkan_internal;
 			depthstencil.depthWriteEnable = pso->desc.dss->depth_write_mask == DepthWriteMask::ZERO ? VK_FALSE : VK_TRUE;
 			depthstencil.depthCompareOp = _ConvertComparisonFunc(pso->desc.dss->depth_func);
 
-			depthstencil.stencilTestEnable = pso->desc.dss->stencil_enable ? VK_TRUE : VK_FALSE;
+			if (pso->desc.dss->stencil_enable)
+			{
+				depthstencil.stencilTestEnable = VK_TRUE;
 
-			depthstencil.front.compareMask = pso->desc.dss->stencil_read_mask;
-			depthstencil.front.writeMask = pso->desc.dss->stencil_write_mask;
-			depthstencil.front.reference = 0; // runtime supplied
-			depthstencil.front.compareOp = _ConvertComparisonFunc(pso->desc.dss->front_face.stencil_func);
-			depthstencil.front.passOp = _ConvertStencilOp(pso->desc.dss->front_face.stencil_pass_op);
-			depthstencil.front.failOp = _ConvertStencilOp(pso->desc.dss->front_face.stencil_fail_op);
-			depthstencil.front.depthFailOp = _ConvertStencilOp(pso->desc.dss->front_face.stencil_depth_fail_op);
+				depthstencil.front.compareMask = pso->desc.dss->stencil_read_mask;
+				depthstencil.front.writeMask = pso->desc.dss->stencil_write_mask;
+				depthstencil.front.reference = 0; // runtime supplied
+				depthstencil.front.compareOp = _ConvertComparisonFunc(pso->desc.dss->front_face.stencil_func);
+				depthstencil.front.passOp = _ConvertStencilOp(pso->desc.dss->front_face.stencil_pass_op);
+				depthstencil.front.failOp = _ConvertStencilOp(pso->desc.dss->front_face.stencil_fail_op);
+				depthstencil.front.depthFailOp = _ConvertStencilOp(pso->desc.dss->front_face.stencil_depth_fail_op);
 
-			depthstencil.back.compareMask = pso->desc.dss->stencil_read_mask;
-			depthstencil.back.writeMask = pso->desc.dss->stencil_write_mask;
-			depthstencil.back.reference = 0; // runtime supplied
-			depthstencil.back.compareOp = _ConvertComparisonFunc(pso->desc.dss->back_face.stencil_func);
-			depthstencil.back.passOp = _ConvertStencilOp(pso->desc.dss->back_face.stencil_pass_op);
-			depthstencil.back.failOp = _ConvertStencilOp(pso->desc.dss->back_face.stencil_fail_op);
-			depthstencil.back.depthFailOp = _ConvertStencilOp(pso->desc.dss->back_face.stencil_depth_fail_op);
+				depthstencil.back.compareMask = pso->desc.dss->stencil_read_mask;
+				depthstencil.back.writeMask = pso->desc.dss->stencil_write_mask;
+				depthstencil.back.reference = 0; // runtime supplied
+				depthstencil.back.compareOp = _ConvertComparisonFunc(pso->desc.dss->back_face.stencil_func);
+				depthstencil.back.passOp = _ConvertStencilOp(pso->desc.dss->back_face.stencil_pass_op);
+				depthstencil.back.failOp = _ConvertStencilOp(pso->desc.dss->back_face.stencil_fail_op);
+				depthstencil.back.depthFailOp = _ConvertStencilOp(pso->desc.dss->back_face.stencil_depth_fail_op);
+			}
+			else
+			{
+				depthstencil.stencilTestEnable = VK_FALSE;
+
+				depthstencil.front.compareMask = 0;
+				depthstencil.front.writeMask = 0;
+				depthstencil.front.reference = 0;
+				depthstencil.front.compareOp = VK_COMPARE_OP_NEVER;
+				depthstencil.front.passOp = VK_STENCIL_OP_KEEP;
+				depthstencil.front.failOp = VK_STENCIL_OP_KEEP;
+				depthstencil.front.depthFailOp = VK_STENCIL_OP_KEEP;
+
+				depthstencil.back.compareMask = 0;
+				depthstencil.back.writeMask = 0;
+				depthstencil.back.reference = 0; // runtime supplied
+				depthstencil.back.compareOp = VK_COMPARE_OP_NEVER;
+				depthstencil.back.passOp = VK_STENCIL_OP_KEEP;
+				depthstencil.back.failOp = VK_STENCIL_OP_KEEP;
+				depthstencil.back.depthFailOp = VK_STENCIL_OP_KEEP;
+			}
 
 			if (CheckCapability(GraphicsDeviceCapability::DEPTH_BOUNDS_TEST))
 			{
@@ -7015,38 +7087,65 @@ using namespace vulkan_internal;
 			if (src_desc.usage == Usage::UPLOAD)
 			{
 				VkBufferImageCopy copy = {};
-				copy.imageExtent.width = dst_desc.width;
-				copy.imageExtent.height = dst_desc.height;
-				copy.imageExtent.depth = 1;
-				copy.imageExtent.width = dst_desc.width;
+				copy.imageSubresource.baseArrayLayer = 0;
+				copy.imageSubresource.layerCount = dst_desc.array_size;
 				copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-				copy.imageSubresource.layerCount = 1;
-				vkCmdCopyBufferToImage(
-					commandlist.GetCommandBuffer(),
-					internal_state_src->staging_resource,
-					internal_state_dst->resource,
-					VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-					1,
-					&copy
-				);
+				const uint32_t data_stride = GetFormatStride(dst_desc.format);
+				uint32_t mip_width = dst_desc.width;
+				uint32_t mip_height = dst_desc.height;
+				uint32_t mip_depth = dst_desc.depth;
+				for (uint32_t mip = 0; mip < dst_desc.mip_levels; ++mip)
+				{
+					copy.imageExtent.width = mip_width;
+					copy.imageExtent.height = mip_height;
+					copy.imageExtent.depth = mip_depth;
+					copy.imageSubresource.mipLevel = mip;
+					vkCmdCopyBufferToImage(
+						commandlist.GetCommandBuffer(),
+						internal_state_src->staging_resource,
+						internal_state_dst->resource,
+						VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+						1,
+						&copy
+					);
+
+					copy.bufferOffset += mip_width * mip_height * mip_depth * data_stride;
+					mip_width = std::max(1u, mip_width / 2);
+					mip_height = std::max(1u, mip_height / 2);
+					mip_depth = std::max(1u, mip_depth / 2);
+				}
+
 			}
 			else if (dst_desc.usage == Usage::READBACK)
 			{
 				VkBufferImageCopy copy = {};
-				copy.imageExtent.width = src_desc.width;
-				copy.imageExtent.height = src_desc.height;
-				copy.imageExtent.depth = 1;
-				copy.imageExtent.width = src_desc.width;
+				copy.imageSubresource.baseArrayLayer = 0;
+				copy.imageSubresource.layerCount = dst_desc.array_size;
 				copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-				copy.imageSubresource.layerCount = 1;
-				vkCmdCopyImageToBuffer(
-					commandlist.GetCommandBuffer(),
-					internal_state_src->resource,
-					VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-					internal_state_dst->staging_resource,
-					1,
-					&copy
-				);
+				const uint32_t data_stride = GetFormatStride(dst_desc.format);
+				uint32_t mip_width = dst_desc.width;
+				uint32_t mip_height = dst_desc.height;
+				uint32_t mip_depth = dst_desc.depth;
+				for (uint32_t mip = 0; mip < dst_desc.mip_levels; ++mip)
+				{
+					copy.imageExtent.width = mip_width;
+					copy.imageExtent.height = mip_height;
+					copy.imageExtent.depth = mip_depth;
+					copy.imageSubresource.mipLevel = mip;
+					vkCmdCopyImageToBuffer(
+						commandlist.GetCommandBuffer(),
+						internal_state_src->resource,
+						VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+						internal_state_dst->staging_resource,
+						1,
+						&copy
+					);
+
+					copy.bufferOffset += mip_width * mip_height * mip_depth * data_stride;
+					mip_width = std::max(1u, mip_width / 2);
+					mip_height = std::max(1u, mip_height / 2);
+					mip_depth = std::max(1u, mip_depth / 2);
+				}
 			}
 			else
 			{
@@ -7298,7 +7397,7 @@ using namespace vulkan_internal;
 					barrierdesc.subresourceRange.baseMipLevel = (uint32_t)std::max(0, barrier.image.mip);
 					barrierdesc.subresourceRange.levelCount = 1;
 					barrierdesc.subresourceRange.baseArrayLayer = (uint32_t)std::max(0, barrier.image.slice);
-					barrierdesc.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS; // this should be 1 but cubemap array complains in debug layer...
+					barrierdesc.subresourceRange.layerCount = 1;
 				}
 				else
 				{
@@ -7666,6 +7765,7 @@ using namespace vulkan_internal;
 		label.color[3] = 1.0f;
 		vkCmdInsertDebugUtilsLabelEXT(commandlist.GetCommandBuffer(), &label);
 	}
+
 }
 
 #endif // WICKEDENGINE_BUILD_VULKAN

@@ -12,6 +12,26 @@ using namespace wi::lua::primitive;
 namespace wi::lua::scene
 {
 
+static wi::scene::Scene* globalscene = &wi::scene::GetScene();
+static wi::scene::CameraComponent* globalcam = &wi::scene::GetCamera();
+
+void SetGlobalScene(wi::scene::Scene* scene)
+{
+	globalscene = scene;
+}
+void SetGlobalCamera(wi::scene::CameraComponent* camera)
+{
+	globalcam = camera;
+}
+wi::scene::Scene* GetGlobalScene()
+{
+	return globalscene;
+}
+wi::scene::CameraComponent* GetGlobalCamera()
+{
+	return globalcam;
+}
+
 int CreateEntity_BindLua(lua_State* L)
 {
 	Entity entity = CreateEntity();
@@ -21,12 +41,12 @@ int CreateEntity_BindLua(lua_State* L)
 
 int GetCamera(lua_State* L)
 {
-	Luna<CameraComponent_BindLua>::push(L, new CameraComponent_BindLua(&wi::scene::GetCamera()));
+	Luna<CameraComponent_BindLua>::push(L, new CameraComponent_BindLua(GetGlobalCamera()));
 	return 1;
 }
 int GetScene(lua_State* L)
 {
-	Luna<Scene_BindLua>::push(L, new Scene_BindLua(&wi::scene::GetScene()));
+	Luna<Scene_BindLua>::push(L, new Scene_BindLua(GetGlobalScene()));
 	return 1;
 }
 int LoadModel(lua_State* L)
@@ -83,7 +103,9 @@ int LoadModel(lua_State* L)
 					wi::lua::SError(L, "LoadModel(string fileName, opt Matrix transform) argument is not a matrix!");
 				}
 			}
-			Entity root = wi::scene::LoadModel(fileName, transform, true);
+			Scene scene;
+			Entity root = wi::scene::LoadModel(scene, fileName, transform, true);
+			GetGlobalScene()->Merge(scene);
 			wi::lua::SSetLongLong(L, root);
 			return 1;
 		}
@@ -104,7 +126,7 @@ int Pick(lua_State* L)
 		{
 			uint32_t renderTypeMask = wi::enums::RENDERTYPE_OPAQUE;
 			uint32_t layerMask = 0xFFFFFFFF;
-			Scene* scene = &wi::scene::GetScene();
+			Scene* scene = GetGlobalScene();
 			if (argc > 1)
 			{
 				renderTypeMask = (uint32_t)wi::lua::SGetInt(L, 2);
@@ -154,7 +176,7 @@ int SceneIntersectSphere(lua_State* L)
 		{
 			uint32_t renderTypeMask = wi::enums::RENDERTYPE_OPAQUE;
 			uint32_t layerMask = 0xFFFFFFFF;
-			Scene* scene = &wi::scene::GetScene();
+			Scene* scene = GetGlobalScene();
 			if (argc > 1)
 			{
 				renderTypeMask = (uint32_t)wi::lua::SGetInt(L, 2);
@@ -204,7 +226,7 @@ int SceneIntersectCapsule(lua_State* L)
 		{
 			uint32_t renderTypeMask = wi::enums::RENDERTYPE_OPAQUE;
 			uint32_t layerMask = 0xFFFFFFFF;
-			Scene* scene = &wi::scene::GetScene();
+			Scene* scene = GetGlobalScene();
 			if (argc > 1)
 			{
 				renderTypeMask = (uint32_t)wi::lua::SGetInt(L, 2);
@@ -351,12 +373,13 @@ Luna<Scene_BindLua>::FunctionType Scene_BindLua::methods[] = {
 	lunamethod(Scene_BindLua, Component_Attach),
 	lunamethod(Scene_BindLua, Component_Detach),
 	lunamethod(Scene_BindLua, Component_DetachChildren),
+
+	lunamethod(Scene_BindLua, GetBounds),
 	{ NULL, NULL }
 };
 Luna<Scene_BindLua>::PropertyType Scene_BindLua::properties[] = {
 	{ NULL, NULL }
 };
-
 
 int Scene_BindLua::Update(lua_State* L)
 {
@@ -1107,6 +1130,12 @@ int Scene_BindLua::Component_DetachChildren(lua_State* L)
 		wi::lua::SError(L, "Scene::Component_DetachChildren(Entity parent) not enough arguments!");
 	}
 	return 0;
+}
+
+int Scene_BindLua::GetBounds(lua_State* L)
+{
+	Luna<AABB_BindLua>::push(L, new AABB_BindLua(scene->bounds));
+	return 1;
 }
 
 
@@ -2149,10 +2178,15 @@ const char LightComponent_BindLua::className[] = "LightComponent";
 Luna<LightComponent_BindLua>::FunctionType LightComponent_BindLua::methods[] = {
 	lunamethod(LightComponent_BindLua, SetType),
 	lunamethod(LightComponent_BindLua, SetRange),
-	lunamethod(LightComponent_BindLua, SetEnergy),
+	lunamethod(LightComponent_BindLua, SetIntensity),
 	lunamethod(LightComponent_BindLua, SetColor),
 	lunamethod(LightComponent_BindLua, SetCastShadow),
+	lunamethod(LightComponent_BindLua, SetVolumetricsEnabled),
+	lunamethod(LightComponent_BindLua, SetOuterConeAngle),
+	lunamethod(LightComponent_BindLua, SetInnerConeAngle),
 	lunamethod(LightComponent_BindLua, GetType),
+
+	lunamethod(LightComponent_BindLua, SetEnergy),
 	lunamethod(LightComponent_BindLua, SetFOV),
 	{ NULL, NULL }
 };
@@ -2194,7 +2228,7 @@ int LightComponent_BindLua::SetRange(lua_State* L)
 	if (argc > 0)
 	{
 		float value = wi::lua::SGetFloat(L, 1);
-		component->range_local = value;
+		component->range = value;
 	}
 	else
 	{
@@ -2209,11 +2243,26 @@ int LightComponent_BindLua::SetEnergy(lua_State* L)
 	if (argc > 0)
 	{
 		float value = wi::lua::SGetFloat(L, 1);
-		component->energy = value;
+		component->BackCompatSetEnergy(value);
 	}
 	else
 	{
 		wi::lua::SError(L, "SetEnergy(float value) not enough arguments!");
+	}
+
+	return 0;
+}
+int LightComponent_BindLua::SetIntensity(lua_State* L)
+{
+	int argc = wi::lua::SGetArgCount(L);
+	if (argc > 0)
+	{
+		float value = wi::lua::SGetFloat(L, 1);
+		component->intensity = value;
+	}
+	else
+	{
+		wi::lua::SError(L, "SetIntensity(float value) not enough arguments!");
 	}
 
 	return 0;
@@ -2254,17 +2303,61 @@ int LightComponent_BindLua::SetCastShadow(lua_State* L)
 
 	return 0;
 }
+int LightComponent_BindLua::SetVolumetricsEnabled(lua_State* L)
+{
+	int argc = wi::lua::SGetArgCount(L);
+	if (argc > 0)
+	{
+		component->SetVolumetricsEnabled(wi::lua::SGetBool(L, 1));
+	}
+	else
+	{
+		wi::lua::SError(L, "SetVolumetricsEnabled(bool value) not enough arguments!");
+	}
+
+	return 0;
+}
 int LightComponent_BindLua::SetFOV(lua_State* L)
 {
 	int argc = wi::lua::SGetArgCount(L);
 	if (argc > 0)
 	{
 		float value = wi::lua::SGetFloat(L, 1);
-		component->fov = value;
+		component->outerConeAngle = value * 0.5f;
 	}
 	else
 	{
 		wi::lua::SError(L, "SetFOV(float value) not enough arguments!");
+	}
+
+	return 0;
+}
+int LightComponent_BindLua::SetOuterConeAngle(lua_State* L)
+{
+	int argc = wi::lua::SGetArgCount(L);
+	if (argc > 0)
+	{
+		float value = wi::lua::SGetFloat(L, 1);
+		component->outerConeAngle = value;
+	}
+	else
+	{
+		wi::lua::SError(L, "SetOuterConeAngle(float value) not enough arguments!");
+	}
+
+	return 0;
+}
+int LightComponent_BindLua::SetInnerConeAngle(lua_State* L)
+{
+	int argc = wi::lua::SGetArgCount(L);
+	if (argc > 0)
+	{
+		float value = wi::lua::SGetFloat(L, 1);
+		component->innerConeAngle = value;
+	}
+	else
+	{
+		wi::lua::SError(L, "SetInnerConeAngle(float value) not enough arguments!");
 	}
 
 	return 0;

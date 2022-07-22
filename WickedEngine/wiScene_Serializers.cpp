@@ -538,6 +538,10 @@ namespace wi::scene
 			{
 				archive >> lod_distance_multiplier;
 			}
+			if (archive.GetVersion() >= 80)
+			{
+				archive >> draw_distance;
+			}
 		}
 		else
 		{
@@ -564,6 +568,10 @@ namespace wi::scene
 			if (archive.GetVersion() >= 76)
 			{
 				archive << lod_distance_multiplier;
+			}
+			if (archive.GetVersion() >= 80)
+			{
+				archive << draw_distance;
 			}
 		}
 	}
@@ -726,9 +734,9 @@ namespace wi::scene
 			{
 				type = POINT; // fallback from old area light
 			}
-			archive >> energy;
-			archive >> range_local;
-			archive >> fov;
+			archive >> intensity;
+			archive >> range;
+			archive >> outerConeAngle;
 			if (archive.GetVersion() < 55)
 			{
 				float shadowBias;
@@ -742,6 +750,28 @@ namespace wi::scene
 			}
 
 			archive >> lensFlareNames;
+
+			if (archive.GetVersion() >= 81)
+			{
+				archive >> forced_shadow_resolution;
+			}
+
+			if (archive.GetVersion() >= 82)
+			{
+				archive >> innerConeAngle;
+			}
+
+			if (archive.GetVersion() < 83)
+			{
+				// Conversion from old light units to physical light units:
+				if (type != DIRECTIONAL)
+				{
+					BackCompatSetEnergy(intensity);
+				}
+				// Conversion from FOV to cone angle:
+				outerConeAngle *= 0.5f;
+				innerConeAngle *= 0.5f;
+			}
 
 			wi::jobsystem::Execute(seri.ctx, [&](wi::jobsystem::JobArgs args) {
 				lensFlareRimTextures.resize(lensFlareNames.size());
@@ -760,9 +790,9 @@ namespace wi::scene
 			archive << _flags;
 			archive << color;
 			archive << (uint32_t)type;
-			archive << energy;
-			archive << range_local;
-			archive << fov;
+			archive << intensity;
+			archive << range;
+			archive << outerConeAngle;
 			if (archive.GetVersion() < 55)
 			{
 				float shadowBias = 0;
@@ -784,6 +814,16 @@ namespace wi::scene
 				}
 			}
 			archive << lensFlareNames;
+
+			if (archive.GetVersion() >= 81)
+			{
+				archive << forced_shadow_resolution;
+			}
+
+			if (archive.GetVersion() >= 82)
+			{
+				archive << innerConeAngle;
+			}
 		}
 	}
 	void CameraComponent::Serialize(wi::Archive& archive, EntitySerializer& seri)
@@ -843,14 +883,14 @@ namespace wi::scene
 			archive >> _flags;
 			archive >> type;
 			archive >> gravity;
-			archive >> range_local;
+			archive >> range;
 		}
 		else
 		{
 			archive << _flags;
 			archive << type;
 			archive << gravity;
-			archive << range_local;
+			archive << range;
 		}
 	}
 	void DecalComponent::Serialize(wi::Archive& archive, EntitySerializer& seri)
@@ -1701,6 +1741,11 @@ namespace wi::scene
 				}
 			}
 
+			// Wait the job system, because from this point, component managers could be resized
+			//	due to more serialization tasks in recursive operation
+			//	The pointers must not be invalidated while serialization jobs are not finished
+			wi::jobsystem::Wait(seri.ctx);
+
 			if (archive.GetVersion() >= 72 && has_flag(flags, EntitySerializeFlags::RECURSIVE))
 			{
 				// serialize children:
@@ -2064,6 +2109,11 @@ namespace wi::scene
 					archive << false;
 				}
 			}
+
+			// Wait the job system, because from this point, component managers could be resized
+			//	due to more serialization tasks in recursive operation
+			//	The pointers must not be invalidated while serialization jobs are not finished
+			wi::jobsystem::Wait(seri.ctx);
 
 			if (archive.GetVersion() >= 72 && has_flag(flags, EntitySerializeFlags::RECURSIVE))
 			{

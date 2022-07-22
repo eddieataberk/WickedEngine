@@ -125,6 +125,11 @@ You can use the Renderer with the following functions, all of which are in the g
 - DrawBox(Matrix boxMatrix, opt Vector color)
 - DrawSphere(Sphere sphere, opt Vector color)
 - DrawCapsule(Capsule capsule, opt Vector color)
+- DrawDebugText(string text, opt Vector position, opt Vector color, opt float scaling, opt int flags)
+	DrawDebugText flags, these can be combined with binary OR operator:
+	[outer]DEBUG_TEXT_DEPTH_TEST		-- text can be occluded by geometry
+	[outer]DEBUG_TEXT_CAMERA_FACING		-- text will be rotated to face the camera
+	[outer]DEBUG_TEXT_CAMERA_SCALING	-- text will be always the same size, independent of distance to camera
 - PutWaterRipple(String imagename, Vector position)
 - PutDecal(Decal decal)
 - PutEnvProbe(Vector pos)
@@ -492,6 +497,8 @@ The scene holds components. Entity handles can be used to retrieve associated co
 - Component_Detach(Entity entity)  -- detaches entity from parent (if hierarchycomponent exists for it). Restores entity's original layer, and applies current transformation to entity
 - Component_DetachChildren(Entity parent)  -- detaches all children from parent, as if calling Component_Detach for all of its children
 
+- GetBounds() : AABB result  -- returns an AABB fully containing objects in the scene. Only valid after scene has been updated.
+
 #### NameComponent
 Holds a string that can more easily identify an entity to humans than an entity ID. 
 - SetName(string value)  -- set the name
@@ -580,11 +587,16 @@ Describes an orientation in 3D space.
 - [outer]POINT : int
 - [outer]SPOT : int
 - SetRange(float value)
-- SetEnergy(float value)
+- SetIntensity(float value) -- Brightness of light in. The units that this is defined in depend on the type of light. Point and spot lights use luminous intensity in candela (lm/sr) while directional lights use illuminance in lux (lm/m2). https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_lights_punctual
 - SetColor(Vector value)
 - SetCastShadow(bool value)
-- SetFOV(float value)
+- SetVolumetricsEnabled(bool value)
+- SetOuterConeAngle(float value) -- outer cone angle for spotlight in radians
+- SetInnerConeAngle(float value) -- inner cone angle for spotlight in radians (0 <= innerConeAngle <= outerConeAngle). Value of 0 disables inner cone angle
 - GetType() : int result
+
+- SetEnergy(float value) -- kept for backwards compatibility with non physical light units (before v0.70.0)
+- SetFOV(float value) -- kept for backwards compatibility with FOV angle (before v0.70.0)
 
 #### ObjectComponent
 - GetMeshID() : Entity
@@ -638,6 +650,7 @@ This is the main entry point and manages the lifetime of the application. Even t
 - SetFPSDisplay(bool active)	-- toggle display of frame rate if info display is enabled
 - SetResolutionDisplay(bool active)	-- toggle display of resolution if info display is enabled
 - SetLogicalSizeDisplay(bool active)	-- toggle display of logical size of canvas if info display is enabled
+- SetColorSpaceDisplay(bool active)	-- toggle display of output color space if info display is enabled
 - SetPipelineCountDisplay(bool active)	-- toggle display of active graphics pipeline count if info display is enabled
 - SetHeapAllocationCountDisplay(bool active)	-- toggle display of heap allocation statistics if info display is enabled
 - SetVRAMUsageDisplay(bool active)	-- toggle display of video memory usage if info display is enabled
@@ -673,10 +686,10 @@ It inherits functions from RenderPath2D, so it can render a 2D overlay.
 - [constructor]RenderPath3D()
 - SetAO(int value)  -- Sets up the ambient occlusion effect (possible values below)
 - AO_DISABLED : int  -- turn off AO computation (use in SetAO() function)
-- AO_SSAO : int  -- enable simple brute force screen space ambient occlusion (use in SetAO() function)
-- AO_HBAO : int  -- enable horizon based screen space ambient occlusion (use in SetAO() function)
-- AO_MSAO : int  -- enable multi scale screen space ambient occlusion (use in SetAO() function)
-- SetHBAOEnabled(bool value)
+	- AO_SSAO : int  -- enable simple brute force screen space ambient occlusion (use in SetAO() function)
+	- AO_HBAO : int  -- enable horizon based screen space ambient occlusion (use in SetAO() function)
+	- AO_MSAO : int  -- enable multi scale screen space ambient occlusion (use in SetAO() function)
+- SetAOPower(float value)  -- applies AO power value if any AO is enabled
 - SetSSREnabled(bool value)
 - SetRaytracedReflectionsEnabled(bool value)
 - SetShadowsEnabled(bool value)

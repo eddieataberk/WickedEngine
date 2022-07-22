@@ -86,8 +86,9 @@ uint load_entitytile(uint tileIndex)
 //#define OBJECTSHADER_USE_POSITION3D				- shader will use world space positions
 //#define OBJECTSHADER_USE_EMISSIVE					- shader will use emissive
 //#define OBJECTSHADER_USE_RENDERTARGETARRAYINDEX	- shader will use dynamic render target slice selection
+//#define OBJECTSHADER_USE_VIEWPORTARRAYINDEX		- shader will use dynamic viewport selection
 //#define OBJECTSHADER_USE_NOCAMERA					- shader will not use camera space transform
-//#define OBJECTSHADER_USE_INSTANCEINDEX				- shader will use instance ID
+//#define OBJECTSHADER_USE_INSTANCEINDEX			- shader will use instance ID
 
 
 #ifdef OBJECTSHADER_LAYOUT_SHADOW
@@ -195,7 +196,7 @@ struct VertexInput
 	ShaderMeshInstance GetInstance()
 	{
 		if (push.instances >= 0)
-			return load_instance(GetInstancePointer().instanceIndex);
+			return load_instance(GetInstancePointer().GetInstanceIndex());
 
 		ShaderMeshInstance inst;
 		inst.init();
@@ -298,6 +299,14 @@ struct PixelInput
 	uint RTIndex : SV_RenderTargetArrayIndex;
 #endif // VPRT_EMULATION
 #endif // OBJECTSHADER_USE_RENDERTARGETARRAYINDEX
+
+#ifdef OBJECTSHADER_USE_VIEWPORTARRAYINDEX
+#ifdef VPRT_EMULATION
+	uint VPIndex : VPINDEX;
+#else
+	uint VPIndex : SV_ViewportArrayIndex;
+#endif // VPRT_EMULATION
+#endif // OBJECTSHADER_USE_VIEWPORTARRAYINDEX
 };
 
 
@@ -418,8 +427,6 @@ inline void ForwardLighting(inout Surface surface, inout Lighting lighting)
 					float edgeBlend = 1 - pow(saturate(abs(clipSpacePos.z)), 8);
 					decalColor.a *= edgeBlend;
 					decalColor *= decal.GetColor();
-					// apply emissive:
-					lighting.direct.specular += max(0, decalColor.rgb * decal.GetEmissive() * edgeBlend);
 					// perform manual blending of decals:
 					//  NOTE: they are sorted top-to-bottom, but blending is performed bottom-to-top
 					decalAccumulation.rgb = mad(1 - decalAccumulation.a, decalColor.a * decalColor.rgb, decalAccumulation.rgb);
@@ -569,7 +576,7 @@ inline void ForwardLighting(inout Surface surface, inout Lighting lighting)
 	[branch]
 	if ((surface.flags & SURFACE_FLAG_GI_APPLIED) == 0 && GetScene().ddgi.color_texture >= 0)
 	{
-		lighting.indirect.diffuse = ddgi_sample_irradiance(surface.P, surface.N);
+		lighting.indirect.diffuse = ddgi_sample_irradiance(surface.P, surface.N) * GetFrame().gi_boost;
 		surface.flags |= SURFACE_FLAG_GI_APPLIED;
 	}
 
@@ -643,8 +650,6 @@ inline void TiledDecals(inout Surface surface, uint flatTileIndex)
 						float edgeBlend = 1 - pow(saturate(abs(clipSpacePos.z)), 8);
 						decalColor.a *= edgeBlend;
 						decalColor *= decal.GetColor();
-						// apply emissive:
-						surface.emissiveColor += max(0, decalColor.rgb * decal.GetEmissive() * edgeBlend);
 						// perform manual blending of decals:
 						//  NOTE: they are sorted top-to-bottom, but blending is performed bottom-to-top
 						decalAccumulation.rgb = mad(1 - decalAccumulation.a, decalColor.a * decalColor.rgb, decalAccumulation.rgb);
@@ -940,7 +945,7 @@ PixelInput main(VertexInput input)
 	PixelInput Out;
 
 #ifdef OBJECTSHADER_USE_INSTANCEINDEX
-	Out.instanceIndex = input.GetInstancePointer().instanceIndex;
+	Out.instanceIndex = input.GetInstancePointer().GetInstanceIndex();
 #endif // OBJECTSHADER_USE_INSTANCEINDEX
 
 	VertexSurface surface;
@@ -995,6 +1000,14 @@ PixelInput main(VertexInput input)
 	Out.pos = mul(xCubemapRenderCams[frustum_index].view_projection, surface.position);
 #endif // OBJECTSHADER_USE_NOCAMERA
 #endif // OBJECTSHADER_USE_RENDERTARGETARRAYINDEX
+
+#ifdef OBJECTSHADER_USE_VIEWPORTARRAYINDEX
+	const uint frustum_index = input.GetInstancePointer().GetFrustumIndex();
+	Out.VPIndex = xCubemapRenderCams[frustum_index].properties.x;
+#ifndef OBJECTSHADER_USE_NOCAMERA
+	Out.pos = mul(xCubemapRenderCams[frustum_index].view_projection, surface.position);
+#endif // OBJECTSHADER_USE_NOCAMERA
+#endif // OBJECTSHADER_USE_VIEWPORTARRAYINDEX
 
 	return Out;
 }

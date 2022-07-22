@@ -34,12 +34,19 @@ Contributions:
 	- Linux controller implementation
 	- Linux network implementation
 	- Fixes
-- Molasses https://github.com/MolassesLover
+- Maeve Garside https://github.com/MolassesLover
 	- Linux package files
+	- Visual Studio Code support improvement
+	- Linux template
 - Igor Alexey https://github.com/sororfortuna
 	- QOI image loader integration
 - Eddie Ataberk https://github.com/eddieataberk
 	- Physics improvements
+- Preben Eriksen https://github.com/plemsoft
+	- Fixes
+	- Extented Dear ImGui integration with a docking branch sample.
+- matpx https://github.com/matpx
+	- Fixes
 
 	
 Support the project on Patreon: https://www.patreon.com/wickedengine
@@ -59,4 +66,9 @@ Patreon supporters:
 - Invictus
 - Scott Hunt
 - Yazan Altaki
+- Tuan NV
+- Robert MacGregor
+- cybernescence
+- Alexander Dahlin
+- blueapples
 

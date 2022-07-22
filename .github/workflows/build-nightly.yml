@@ -37,8 +37,9 @@ jobs:
           Content/
           README.md
           LICENSE.md
-          other_licenses.txt
+          third_party_software.txt
           features.txt
+          credits.txt
           Editor/images/
           Editor/terrain/
           Editor/sound/
@@ -55,8 +56,9 @@ jobs:
           Content/
           README.md
           LICENSE.md
-          other_licenses.txt
+          third_party_software.txt
           features.txt
+          credits.txt
           Tests/images/
           Tests/sound/
           Tests/*.ini
@@ -74,10 +76,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
-        sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-1.2.170-focal.list https://packages.lunarg.com/vulkan/1.2.170/lunarg-vulkan-1.2.170-focal.list
         sudo apt update
-        sudo apt install vulkan-sdk
         sudo apt install libsdl2-dev
 
     - name: Build
@@ -85,14 +84,14 @@ jobs:
         mkdir build
         cd build
         cmake .. -DCMAKE_BUILD_TYPE=Release
-        make
+        make -j$(nproc)
         echo "---Generating Shader Dump---"
         cd WickedEngine
         ./offlineshadercompiler spirv rebuild shaderdump
         mv wiShaderDump.h ../../WickedEngine/
         cd ..
         echo "---Rebuilding with ShaderDump---"
-        make -B
+        make -B -j $(nproc)
         
     - name: Move binaries
       run: |
@@ -107,8 +106,9 @@ jobs:
           Content/
           README.md
           LICENSE.md
-          other_licenses.txt
+          third_party_software.txt
           features.txt
+          credits.txt
           Editor/images/
           Editor/terrain/
           Editor/sound/
@@ -125,8 +125,9 @@ jobs:
           Content/
           README.md
           LICENSE.md
-          other_licenses.txt
+          third_party_software.txt
           features.txt
+          credits.txt
           Tests/images/
           Tests/sound/
           Tests/*.ini
@@ -176,8 +177,9 @@ jobs:
           Content/
           README.md
           LICENSE.md
-          other_licenses.txt
+          third_party_software.txt
           features.txt
+          credits.txt
           Editor/images/
           Editor/terrain/
           Editor/sound/
@@ -194,8 +196,9 @@ jobs:
           Content/
           README.md
           LICENSE.md
-          other_licenses.txt
+          third_party_software.txt
           features.txt
+          credits.txt
           Tests/images/
           Tests/sound/
           Tests/*.ini

@@ -29,10 +29,18 @@ namespace wi::font
 
 	struct Params
 	{
-		float posX = 0; // position in horizontal direction (logical canvas units)
-		float posY = 0; // position in vertical direction (logical canvas units)
+		union
+		{
+			XMFLOAT3 position = {}; // position in logical canvas units
+			struct // back-compat aliasing
+			{
+				float posX; // position in horizontal direction (logical canvas units)
+				float posY; // position in vertical direction (logical canvas units)
+			};
+		};
 		int size = WIFONTSIZE_DEFAULT; // line height (logical canvas units)
 		float scaling = 1; // this will apply upscaling to the text while keeping the same resolution (size) of the font
+		float rotation = 0; // rotation around alignment anchor (in radians)
 		float spacingX = 0, spacingY = 0; // minimum spacing between characters (logical canvas units)
 		Alignment h_align = WIFALIGN_LEFT; // horizontal alignment
 		Alignment v_align = WIFALIGN_TOP; // vertical alignment
@@ -47,6 +55,32 @@ namespace wi::font
 		float shadow_offset_x = 0; // offset for shadow under the text in logical canvas coordinates
 		float shadow_offset_y = 0; // offset for shadow under the text in logical canvas coordinates
 		Cursor cursor; // cursor can be used to continue text drawing by taking the Draw's return value (optional)
+		float hdr_scaling = 1.0f; // a scaling value for use by linear output mapping
+		const XMMATRIX* customProjection = nullptr;
+		const XMMATRIX* customRotation = nullptr;
+
+		enum FLAGS
+		{
+			EMPTY = 0,
+			OUTPUT_COLOR_SPACE_HDR10_ST2084 = 1 << 1,
+			OUTPUT_COLOR_SPACE_LINEAR = 1 << 2,
+			DEPTH_TEST = 1 << 3,
+		};
+		uint32_t _flags = EMPTY;
+
+		constexpr bool isHDR10OutputMappingEnabled() const { return _flags & OUTPUT_COLOR_SPACE_HDR10_ST2084; }
+		constexpr bool isLinearOutputMappingEnabled() const { return _flags & OUTPUT_COLOR_SPACE_LINEAR; }
+		constexpr bool isDepthTestEnabled() const { return _flags & DEPTH_TEST; }
+
+		// enable HDR10 output mapping, if this image can be interpreted in linear space and converted to HDR10 display format
+		constexpr void enableHDR10OutputMapping() { _flags |= OUTPUT_COLOR_SPACE_HDR10_ST2084; }
+		// enable linear output mapping, which means removing gamma curve and outputting in linear space (useful for blending in HDR space)
+		constexpr void enableLinearOutputMapping(float scaling = 1.0f) { _flags |= OUTPUT_COLOR_SPACE_LINEAR; hdr_scaling = scaling; }
+		constexpr void enableDepthTest() { _flags |= DEPTH_TEST; }
+
+		constexpr void disableHDR10OutputMapping() { _flags &= ~OUTPUT_COLOR_SPACE_HDR10_ST2084; }
+		constexpr void disableLinearOutputMapping() { _flags &= ~OUTPUT_COLOR_SPACE_LINEAR; }
+		constexpr void disableDepthTest() { _flags &= ~DEPTH_TEST; }
 
 		Params(
 			float posX = 0,
@@ -95,12 +129,16 @@ namespace wi::font
 	// Draw text with specified parameters and return cursor for last word
 	//	The next Draw() can continue from where this left off by using the return value of this function
 	//	in wi::font::Params::cursor
+	Cursor Draw(const char* text, size_t text_length, const Params& params, wi::graphics::CommandList cmd);
+	Cursor Draw(const wchar_t* text, size_t text_length, const Params& params, wi::graphics::CommandList cmd);
 	Cursor Draw(const char* text, const Params& params, wi::graphics::CommandList cmd);
 	Cursor Draw(const wchar_t* text, const Params& params, wi::graphics::CommandList cmd);
 	Cursor Draw(const std::string& text, const Params& params, wi::graphics::CommandList cmd);
 	Cursor Draw(const std::wstring& text, const Params& params, wi::graphics::CommandList cmd);
 
 	// Computes the text's size measurements in logical canvas coordinates
+	XMFLOAT2 TextSize(const char* text, size_t text_length, const Params& params);
+	XMFLOAT2 TextSize(const wchar_t* text, size_t text_length, const Params& params);
 	XMFLOAT2 TextSize(const char* text, const Params& params);
 	XMFLOAT2 TextSize(const wchar_t* text, const Params& params);
 	XMFLOAT2 TextSize(const std::string& text, const Params& params);
@@ -108,6 +146,8 @@ namespace wi::font
 
 	// Computes the text's width in logical canvas coordinates
 	//	Avoid calling TextWidth() and TextHeight() both, instead use TextSize() if you need both measurements!
+	float TextWidth(const char* text, size_t text_length, const Params& params);
+	float TextWidth(const wchar_t* text, size_t text_length, const Params& params);
 	float TextWidth(const char* text, const Params& params);
 	float TextWidth(const wchar_t* text, const Params& params);
 	float TextWidth(const std::string& text, const Params& params);
@@ -115,6 +155,8 @@ namespace wi::font
 
 	// Computes the text's height in logical canvas coordinates
 	//	Avoid calling TextWidth() and TextHeight() both, instead use TextSize() if you need both measurements!
+	float TextHeight(const char* text, size_t text_length, const Params& params);
+	float TextHeight(const wchar_t* text, size_t text_length, const Params& params);
 	float TextHeight(const char* text, const Params& params);
 	float TextHeight(const wchar_t* text, const Params& params);
 	float TextHeight(const std::string& text, const Params& params);

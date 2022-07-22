@@ -55,10 +55,10 @@ namespace wi::lua::renderer
 		int argc = wi::lua::SGetArgCount(L);
 		if (argc > 1)
 		{
-			wi::renderer::SetShadowProps2D(wi::lua::SGetInt(L, 1), wi::lua::SGetInt(L, 2));
+			wi::renderer::SetShadowProps2D(wi::lua::SGetInt(L, 1));
 		}
 		else
-			wi::lua::SError(L, "SetShadowProps2D(int resolution, int count) not enough arguments!");
+			wi::lua::SError(L, "SetShadowProps2D(int max_resolution) not enough arguments!");
 		return 0;
 	}
 	int SetShadowPropsCube(lua_State* L)
@@ -66,10 +66,10 @@ namespace wi::lua::renderer
 		int argc = wi::lua::SGetArgCount(L);
 		if (argc > 1)
 		{
-			wi::renderer::SetShadowPropsCube(wi::lua::SGetInt(L, 1), wi::lua::SGetInt(L, 2));
+			wi::renderer::SetShadowPropsCube(wi::lua::SGetInt(L, 1));
 		}
 		else
-			wi::lua::SError(L, "SetShadowPropsCube(int resolution, int count) not enough arguments!");
+			wi::lua::SError(L, "SetShadowPropsCube(int max_resolution) not enough arguments!");
 		return 0;
 	}
 	int SetDebugPartitionTreeEnabled(lua_State* L)
@@ -301,6 +301,54 @@ namespace wi::lua::renderer
 
 		return 0;
 	}
+	int DrawDebugText(lua_State* L)
+	{
+		int argc = wi::lua::SGetArgCount(L);
+		if (argc > 0)
+		{
+			std::string text = wi::lua::SGetString(L, 1);
+			wi::renderer::DebugTextParams params;
+			if (argc > 1)
+			{
+				Vector_BindLua* position = Luna<Vector_BindLua>::lightcheck(L, 2);
+				if (position != nullptr)
+				{
+					params.position.x = position->x;
+					params.position.y = position->y;
+					params.position.z = position->z;
+
+					if (argc > 2)
+					{
+						Vector_BindLua* color = Luna<Vector_BindLua>::lightcheck(L, 3);
+						if (color != nullptr)
+						{
+							params.color = *color;
+
+							if (argc > 3)
+							{
+								params.scaling = wi::lua::SGetFloat(L, 4);
+
+								if (argc > 4)
+								{
+									params.flags = wi::lua::SGetInt(L, 5);
+								}
+							}
+						}
+						else
+							wi::lua::SError(L, "DrawDebugText(string text, opt Vector position, opt Vector color, opt float scaling, opt int flags) third argument was not a Vector!");
+					}
+				}
+				else
+					wi::lua::SError(L, "DrawDebugText(string text, opt Vector position, opt Vector color, opt float scaling, opt int flags) second argument was not a Vector!");
+
+			}
+			wi::renderer::DrawDebugText(text.c_str(), params);
+		}
+		else
+			wi::lua::SError(L, "DrawDebugText(string text, opt Vector position, opt Vector color, opt float scaling, opt int flags) not enough arguments!");
+
+		return 0;
+	}
 	int PutWaterRipple(lua_State* L)
 	{
 		int argc = wi::lua::SGetArgCount(L);
@@ -312,7 +360,7 @@ namespace wi::lua::renderer
 			{
 				XMFLOAT3 pos;
 				XMStoreFloat3(&pos, XMLoadFloat4(v));
-				wi::scene::GetScene().PutWaterRipple(wi::lua::GetScriptPath() + name, pos);
+				GetGlobalScene()->PutWaterRipple(wi::lua::GetScriptPath() + name, pos);
 			}
 			else
 				wi::lua::SError(L, "PutWaterRipple(String imagename, Vector position) argument is not a Vector!");
@@ -327,7 +375,7 @@ namespace wi::lua::renderer
 		Scene_BindLua* scene = Luna<Scene_BindLua>::lightcheck(L, 1);
 		if (scene == nullptr)
 		{
-			wi::renderer::ClearWorld(wi::scene::GetScene());
+			wi::renderer::ClearWorld(*GetGlobalScene());
 		}
 		else
 		{
@@ -372,6 +420,7 @@ namespace wi::lua::renderer
 			wi::lua::RegisterFunc("DrawBox", DrawBox);
 			wi::lua::RegisterFunc("DrawSphere", DrawSphere);
 			wi::lua::RegisterFunc("DrawCapsule", DrawCapsule);
+			wi::lua::RegisterFunc("DrawDebugText", DrawDebugText);
 			wi::lua::RegisterFunc("PutWaterRipple", PutWaterRipple);
 
 
@@ -379,6 +428,10 @@ namespace wi::lua::renderer
 			wi::lua::RunText("PICK_OPAQUE = 1");
 			wi::lua::RunText("PICK_TRANSPARENT = 2");
 			wi::lua::RunText("PICK_WATER = 4");
+
+			wi::lua::RunText("DEBUG_TEXT_DEPTH_TEST = 1");
+			wi::lua::RunText("DEBUG_TEXT_CAMERA_FACING = 2");
+			wi::lua::RunText("DEBUG_TEXT_CAMERA_SCALING = 4");
 
 
 			wi::lua::RegisterFunc("ClearWorld", ClearWorld);

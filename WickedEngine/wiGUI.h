@@ -182,8 +182,8 @@ namespace wi::gui
 		//	0: no extra offset
 		//	1: full extra offset
 		void SetOverScroll(float amount) { overscroll = amount; }
-		// Check whether the scrollbar is required (when the items don't and scrolling could be used)
-		bool IsScrollbarRequired() const { return scrollbar_granularity < 1; }
+		// Check whether the scrollbar is required (when the items don't fit and scrolling could be used)
+		bool IsScrollbarRequired() const { return scrollbar_granularity < 0.999f; }
 
 		enum SCROLLBAR_STATE
 		{
@@ -336,6 +336,8 @@ namespace wi::gui
 		void SetSelectedByUserdata(uint64_t userdata);
 		void SetSelectedByUserdataWithoutCallback(uint64_t userdata); // SetSelectedByUserdata() but the OnSelect callback will not be executed
 		int GetSelected() const;
+		void SetItemText(int index, const std::string& text);
+		void SetItemUserdata(int index, uint64_t userdata);
 		std::string GetItemText(int index) const;
 		uint64_t GetItemUserData(int index) const;
 		size_t GetItemCount() const { return items.size(); }

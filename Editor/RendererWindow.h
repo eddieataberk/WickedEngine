@@ -21,7 +21,9 @@ enum PICKTYPE
 class RendererWindow : public wi::gui::Window
 {
 public:
-	void Create(EditorComponent* editorcomponent);
+	void Create(EditorComponent* editor);
+
+	EditorComponent* editor = nullptr;
 
 	wi::gui::CheckBox vsyncCheckBox;
 	wi::gui::ComboBox swapchainComboBox;
@@ -42,8 +44,9 @@ public:
 	wi::gui::Slider voxelRadianceConeTracingSlider;
 	wi::gui::Slider voxelRadianceRayStepSizeSlider;
 	wi::gui::Slider voxelRadianceMaxDistanceSlider;
+	wi::gui::CheckBox nameDebugCheckBox;
 	wi::gui::CheckBox physicsDebugCheckBox;
-	wi::gui::CheckBox partitionBoxesCheckBox;
+	wi::gui::CheckBox aabbDebugCheckBox;
 	wi::gui::CheckBox boneLinesCheckBox;
 	wi::gui::CheckBox debugEmittersCheckBox;
 	wi::gui::CheckBox debugForceFieldsCheckBox;
